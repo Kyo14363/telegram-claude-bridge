@@ -1,0 +1,29 @@
+﻿# Environment variables (contains secrets)
+.env
+
+# Logs
+logs/*.log
+logs/*.log.*
+
+# Conversation history (may contain private data)
+conversation_history.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.class
+*.so
+.Python
+venv/
+.venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
