@@ -61,7 +61,7 @@ claude  # Follow prompts to authenticate
 
 ```bash
 # Clone the repository
-git clone https://github.com/YOUR_USERNAME/telegram-claude-bridge.git
+git clone https://github.com/Kyo14363/telegram-claude-bridge.git
 cd telegram-claude-bridge
 
 # Install dependencies
@@ -235,7 +235,7 @@ claude  # 依照提示完成認證
 
 ```bash
 # Clone 專案
-git clone https://github.com/YOUR_USERNAME/telegram-claude-bridge.git
+git clone https://github.com/Kyo14363/telegram-claude-bridge.git
 cd telegram-claude-bridge
 
 # 安裝依賴
