@@ -1,12 +1,18 @@
-﻿# Telegram Claude Code Bridge
+﻿# Telegram Claude Code Bridge v2.4
 
-A lightweight bridge that allows you to control [Claude Code CLI](https://claude.ai/code) from your phone via Telegram, with conversation history support.
+A lightweight bridge that allows you to control [Claude Code CLI](https://claude.ai/code) from your phone via Telegram, with conversation history, automatic URL content fetching, and AI-powered content analysis.
 
 **[繁體中文說明](#繁體中文)**
 
 ## Features
 
 - **Conversation Context Memory** - Maintains conversation history across messages, so Claude understands references like "this", "that one", "the three items mentioned above"
+- **Automatic URL Processing** - Share any link and the bot automatically fetches content for Claude to analyze
+  - X/Twitter → fxtwitter API (fast) → yt-dlp (fallback)
+  - YouTube → yt-dlp metadata extraction
+  - Other URLs → HTTP title/description extraction
+- **`/fetch` Deep Analysis** - Fetch URL content → Claude analysis → save as AI-friendly Markdown
+- **`/extract` Structured Extraction** - Extract structured data from Claude's responses using LangExtract + Gemini
 - **Daily Log Rotation** - Automatic log file rotation with configurable retention period
 - **Simple Deployment** - Single Python file, no Docker required
 - **Windows Native** - Built and tested on Windows, works out of the box
@@ -107,6 +113,20 @@ Open Telegram, find your bot, and send a message!
 | `/history` | Show conversation history |
 | `/clear` | Clear conversation history |
 | `/exec <cmd>` | Execute PowerShell command directly |
+| `/fetch` | Deep fetch last URL → Claude analysis → save to Markdown |
+| `/extract` | Structured data extraction on last Claude response |
+
+## URL Auto-Processing
+
+When you share a URL in your message, the bridge automatically fetches content before sending to Claude:
+
+| Platform | Strategy | Details |
+|----------|----------|---------|
+| X/Twitter | fxtwitter → yt-dlp → HTTP | Rich tweet data including author, text, media, engagement |
+| YouTube | yt-dlp → HTTP | Video metadata, duration, view count, subtitles |
+| Other URLs | HTTP fallback | Page title + OG/meta description |
+
+With LangExtract enabled, general URLs are further enhanced with AI-structured extraction (topics, key data, entities).
 
 ## Configuration
 
@@ -115,23 +135,27 @@ All configuration is done via environment variables in `.env`:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `TELEGRAM_BOT_TOKEN` | (required) | Your Telegram bot token from @BotFather |
-| `ALLOWED_USER_ID` | (required) | Your Telegram user ID from @userinfobot |
+| `ALLOWED_USER_ID` | (required) | Your Telegram user ID (supports comma-separated multiple IDs) |
 | `LOG_RETENTION_DAYS` | 14 | Days to keep log files |
 | `MAX_HISTORY_ROUNDS` | 10 | Conversation rounds to maintain as context |
 | `TIMEOUT` | 300 | Claude execution timeout in seconds |
+| `URL_FETCH_TIMEOUT` | 15 | URL fetch timeout in seconds |
+| `GOOGLE_API_KEY` | (optional) | Google API key for LangExtract features (`/extract`, enhanced URL analysis) |
 
 ## Project Structure
 
 ```
 telegram-claude-bridge/
-├── telegram_claude_bridge.py   # Main script
+├── telegram_claude_bridge.py   # Main script (v2.4)
 ├── .env.example                # Environment template
 ├── .env                        # Your configuration (not in git)
 ├── requirements.txt            # Python dependencies
+├── CHANGELOG.md                # Version history
 ├── LICENSE                     # MIT License
 ├── logs/                       # Log files (auto-created)
-│   └── bridge.log              # Current day log
+│   ├── bridge.log              # Current day log
 │   └── bridge.log.YYYY-MM-DD   # Historical logs
+├── fetch_outputs/              # /fetch results (auto-created)
 └── conversation_history.json   # Conversation history (auto-created)
 ```
 
@@ -174,13 +198,19 @@ Issues and pull requests are welcome!
 
 # 繁體中文
 
-## Telegram Claude Code 橋接器
+## Telegram Claude Code 橋接器 v2.4
 
-一個輕量級的橋接工具，讓你可以透過手機 Telegram 遠端操控電腦上的 Claude Code CLI，並支援對話歷史記憶功能。
+一個輕量級的橋接工具，讓你可以透過手機 Telegram 遠端操控電腦上的 Claude Code CLI，支援對話歷史記憶、自動 URL 內容抓取，以及 AI 驅動的內容分析。
 
 ## 功能特色
 
 - **對話脈絡記憶** - 自動維護對話歷史，Claude 能理解「這個」、「那三項」等指代詞
+- **自動 URL 處理** - 分享任何連結，Bot 自動抓取內容供 Claude 分析
+  - X/Twitter → fxtwitter API（快速）→ yt-dlp（備用）
+  - YouTube → yt-dlp 影片資訊擷取
+  - 其他網站 → HTTP 標題/描述抓取
+- **`/fetch` 深度分析** - 抓取 URL 內容 → Claude 分析 → 存為 AI 友善的 Markdown
+- **`/extract` 結構化萃取** - 使用 LangExtract + Gemini 從 Claude 回覆中萃取結構化資料
 - **每日 Log 輪換** - 自動產生每日 log 檔案，並定期清理舊檔
 - **簡單部署** - 單一 Python 檔案，不需要 Docker
 - **Windows 原生支援** - 專為 Windows 環境設計
@@ -279,6 +309,20 @@ start_bridge.bat
 | `/history` | 顯示對話歷史 |
 | `/clear` | 清空對話歷史 |
 | `/exec <指令>` | 直接執行 PowerShell 指令 |
+| `/fetch` | 深度抓取最近 URL → Claude 分析 → 存為 Markdown |
+| `/extract` | 對最近的 Claude 回覆做結構化資料萃取 |
+
+## URL 自動處理
+
+分享 URL 時，橋接器會自動抓取內容再傳給 Claude：
+
+| 平台 | 策略 | 說明 |
+|------|------|------|
+| X/Twitter | fxtwitter → yt-dlp → HTTP | 完整推文資料（作者、內容、媒體、互動數據） |
+| YouTube | yt-dlp → HTTP | 影片資訊、時長、觀看數、字幕 |
+| 其他網站 | HTTP fallback | 頁面標題 + OG/meta 描述 |
+
+啟用 LangExtract 後，一般 URL 會額外進行 AI 結構化萃取（主題、關鍵數據、實體）。
 
 ## 設定選項
 
@@ -287,10 +331,12 @@ start_bridge.bat
 | 變數 | 預設值 | 說明 |
 |------|--------|------|
 | `TELEGRAM_BOT_TOKEN` | (必填) | 從 @BotFather 取得的 bot token |
-| `ALLOWED_USER_ID` | (必填) | 從 @userinfobot 取得的 user ID |
+| `ALLOWED_USER_ID` | (必填) | 從 @userinfobot 取得的 user ID（支援逗號分隔多 ID） |
 | `LOG_RETENTION_DAYS` | 14 | Log 檔案保留天數 |
 | `MAX_HISTORY_ROUNDS` | 10 | 對話歷史保留輪數 |
 | `TIMEOUT` | 300 | Claude 執行超時秒數 |
+| `URL_FETCH_TIMEOUT` | 15 | URL 抓取超時秒數 |
+| `GOOGLE_API_KEY` | (選填) | Google API Key，用於 LangExtract 功能（`/extract`、增強 URL 分析） |
 
 ## 疑難排解
 
