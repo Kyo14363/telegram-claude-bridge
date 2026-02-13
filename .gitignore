@@ -2,11 +2,15 @@
 .env
 
 # Logs
-logs/*.log
-logs/*.log.*
+logs/
+*.log
+*.log.*
 
 # Conversation history (may contain private data)
 conversation_history.json
+
+# Fetch outputs (may contain private data)
+fetch_outputs/
 
 # Python
 __pycache__/
@@ -27,3 +31,7 @@ ENV/
 # OS
 .DS_Store
 Thumbs.db
+
+# Backups
+*.bak
+*.bak.*

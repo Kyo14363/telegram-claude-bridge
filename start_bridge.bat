@@ -1,7 +1,8 @@
 @echo off
-title Telegram Claude Bridge
+title Telegram Claude Bridge v2.4
 echo ========================================
-echo   Telegram Claude Code Bridge
+echo   Telegram Claude Code Bridge v2.4
+echo   (Context Memory + URL Fetch + LangExtract)
 echo   Press Ctrl+C to stop
 echo ========================================
 echo.
@@ -33,7 +34,7 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 echo.
-echo [Starting] Telegram Claude Bridge...
+echo [Starting] Telegram Claude Bridge v2.4...
 echo.
 
 python telegram_claude_bridge.py

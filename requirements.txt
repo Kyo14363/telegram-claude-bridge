@@ -1,2 +1,11 @@
 ﻿python-telegram-bot>=20.0
 python-dotenv>=1.0.0
+
+# Optional: URL content fetching (recommended)
+requests>=2.28.0
+
+# Optional: YouTube/social media metadata extraction
+# yt-dlp>=2024.0
+
+# Optional: Structured content extraction via Gemini
+# langextract>=0.1.0
