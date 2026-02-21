@@ -1,8 +1,8 @@
 @echo off
-title Telegram Claude Bridge v2.4
+title Telegram Claude Bridge v2.6
 echo ========================================
-echo   Telegram Claude Code Bridge v2.4
-echo   (Context Memory + URL Fetch + LangExtract)
+echo   Telegram - Claude Code Bridge v2.6
+echo   (Modular: vision + url_fetchers)
 echo   Press Ctrl+C to stop
 echo ========================================
 echo.
@@ -33,10 +33,17 @@ if %ERRORLEVEL% NEQ 0 (
     pip install -r requirements.txt
 )
 
+REM Check google-generativeai (optional)
+python -c "import google.generativeai" >nul 2>nul
+if %ERRORLEVEL% NEQ 0 (
+    echo [Note] google-generativeai not installed. Image analysis will be disabled.
+    echo To enable: pip install google-generativeai
+)
+
 echo.
-echo [Starting] Telegram Claude Bridge v2.4...
+echo [Starting] Telegram Claude Bridge v2.6...
 echo.
 
-python telegram_claude_bridge.py
+python telegram_bridge_claude.py
 
 pause
