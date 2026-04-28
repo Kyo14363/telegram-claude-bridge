@@ -1,37 +1,17 @@
 # Changelog
 
-## v2.4 (2026-02-13)
+## v3.1 Public Sync
 
-### New Features
-- **`/fetch` command** - Deep fetch URL content → Claude analysis → save as AI-friendly Markdown to `fetch_outputs/`
-- **`/extract` command** - On-demand structured data extraction using LangExtract (Gemini)
-- **LangExtract integration** - Auto-enhance general URL content with structured extraction (topic, key data, entities, conclusion)
-- **`fetch_outputs/` directory** - Timestamped Markdown files for each deep fetch result
+- Upgraded the public bridge to the persistent Claude Agent SDK architecture.
+- Added environment-driven configuration for bot token, allowed users, paths, SDK settings, and optional Gemini features.
+- Added token redaction for Telegram API URLs in logs.
+- Added `trafilatura` extraction for general articles/news pages before HTTP fallback.
+- Added Playwright-first X/Twitter reply capture prompts.
+- Trimmed the public command set to status, session, browser, history, and diagnostics commands.
+- Added `metrics.py` and `sdk_smoke_test.py`.
+- Updated runtime dependency list and startup script.
 
-### URL Processing (v2.2+)
-- **fxtwitter API** - Rich X/Twitter tweet parsing (author, text, media, engagement, quotes)
-- **yt-dlp (Python API)** - YouTube / social media metadata extraction (no subprocess)
-- **HTTP fallback** - Page title + OG/meta description extraction
-- **Cascade strategy** - X/Twitter: fxtwitter → yt-dlp → HTTP | YouTube: yt-dlp → HTTP | Others: HTTP
+## v2.x
 
-### Core
-- **Conversation context memory** - Maintains rolling history (configurable rounds)
-- **Daily log rotation** - Auto-rotate with configurable retention period
-- **`.env` configuration** - All secrets and settings via environment variables
-- **Multi-user support** - Comma-separated `ALLOWED_USER_ID`
-
-### Dependencies
-- `python-telegram-bot` >= 20.0 (required)
-- `python-dotenv` >= 1.0.0 (required)
-- `requests` >= 2.28.0 (recommended, for URL fetching)
-- `yt-dlp` (optional, for YouTube/social media)
-- `langextract` (optional, for /extract and LangExtract enhancement)
-- `GOOGLE_API_KEY` env var (required for LangExtract features)
-
----
-
-## v1.0 (Initial)
-
-- Basic Telegram ↔ Claude Code CLI bridge
-- Conversation history
-- `/clear`, `/history`, `/help`, `/status`, `/exec` commands
+- Original stateless `claude --print` bridge.
+- URL preprocessing, image analysis, and basic Telegram command handling.

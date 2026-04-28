@@ -1,42 +1,38 @@
 @echo off
-title Telegram Claude Bridge v2.4
+setlocal
+title Telegram Claude Bridge v3.1
+
+cd /d "%~dp0" || goto :end
+
+if exist ".env" (
+    for /f "usebackq tokens=1,* delims==" %%A in (".env") do (
+        if not "%%A"=="" if not "%%A:~0,1%"=="#" set "%%A=%%B"
+    )
+)
+
 echo ========================================
-echo   Telegram Claude Code Bridge v2.4
-echo   (Context Memory + URL Fetch + LangExtract)
-echo   Press Ctrl+C to stop
+echo   Telegram Claude Bridge v3.1
+echo   Persistent Claude Agent SDK
 echo ========================================
 echo.
 
-cd /d "%~dp0"
+if "%TELEGRAM_BOT_TOKEN%"=="" (
+    echo [Error] TELEGRAM_BOT_TOKEN is not set.
+    echo Copy .env.example to .env and fill in your values.
+    goto :end
+)
 
-REM Check Claude CLI
 where claude >nul 2>nul
-if %ERRORLEVEL% NEQ 0 (
-    echo [Error] Claude CLI not found!
-    echo Please install: npm install -g @anthropic-ai/claude-code
-    pause
-    exit /b 1
+if errorlevel 1 (
+    echo [Warn] claude command is not in PATH. Set CLAUDE_CLI_PATH if needed.
 )
 
-REM Check .env file
-if not exist ".env" (
-    echo [Error] .env file not found!
-    echo Please copy .env.example to .env and configure it.
-    pause
-    exit /b 1
-)
+python -m pip install -r requirements.txt
+if errorlevel 1 goto :end
 
-REM Check Python dependencies
-python -c "import telegram" >nul 2>nul
-if %ERRORLEVEL% NEQ 0 (
-    echo [Installing] python-telegram-bot...
-    pip install -r requirements.txt
-)
+python telegram_bridge_claude.py
 
+:end
 echo.
-echo [Starting] Telegram Claude Bridge v2.4...
-echo.
-
-python telegram_claude_bridge.py
-
 pause
+endlocal

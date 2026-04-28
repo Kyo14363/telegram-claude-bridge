@@ -1,4 +1,4 @@
-﻿# Environment variables (contains secrets)
+# Environment variables (contains secrets)
 .env
 
 # Logs
@@ -8,9 +8,12 @@ logs/
 
 # Conversation history (may contain private data)
 conversation_history.json
+session_state.json
+stats.json
 
 # Fetch outputs (may contain private data)
 fetch_outputs/
+obsidian_clippings/
 
 # Python
 __pycache__/
