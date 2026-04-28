@@ -1,3 +1,4 @@
+
 # Telegram Claude Bridge public runtime dependencies
 python-telegram-bot==22.6
 requests==2.32.5
@@ -6,3 +7,18 @@ google-generativeai==0.8.6
 langextract>=1.0.0
 claude-agent-sdk>=0.1.68
 trafilatura>=2.0.0
+=======
+python-telegram-bot>=20.0
+python-dotenv>=1.0.0
+
+# Optional: URL content fetching (recommended)
+requests>=2.28.0
+
+# Optional: YouTube/social media metadata extraction
+# yt-dlp>=2024.0
+
+# Optional: Image analysis via Gemini Vision
+# google-generativeai>=0.3.0
+
+# Optional: Structured content extraction via Gemini
+# langextract>=0.1.0
