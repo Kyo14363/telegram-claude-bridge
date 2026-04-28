@@ -8,9 +8,7 @@ vision.py — 通用圖片理解模組
 
 import os
 import base64
-
 import time
-
 import logging
 from typing import Optional, List, Tuple
 
@@ -99,23 +97,16 @@ def download_image_to_base64(image_url: str, timeout: int = 30) -> Optional[Tupl
         return None
 
 
-
 def describe_image_via_gemini(b64_data: str, mime_type: str, context: str = "",
                               max_retries: int = 3) -> Optional[str]:
     """
     使用 Gemini Vision API 描述單張圖片，含 retry 機制。
     429 / 503 等暫時性錯誤會自動重試（exponential backoff）。
-
-def describe_image_via_gemini(b64_data: str, mime_type: str, context: str = "") -> Optional[str]:
-    """
-    使用 Gemini 2.0 Flash Vision API 描述單張圖片。
-
     context: 可選的上下文提示（例如推文文字），幫助 Gemini 更好理解圖片。
     回傳圖片描述文字或 None。
     """
     if not GENAI_AVAILABLE:
         return None
-
 
     model = genai.GenerativeModel('gemini-2.5-flash')
 
@@ -182,39 +173,6 @@ def describe_image_from_bytes(image_bytes: bytes, mime_type: str = "image/jpeg",
     b64_data = base64.b64encode(image_bytes).decode('utf-8')
     logger.info(f"[image] 從 bytes 分析圖片，{len(image_bytes)} bytes, {mime_type}")
     return describe_image_via_gemini(b64_data, mime_type, context)
-
-    try:
-        model = genai.GenerativeModel('gemini-2.0-flash')
-
-        if context:
-            prompt_text = (
-                f"這張圖片來自一則社群媒體貼文，貼文內容為：{context[:500]}\n\n"
-                "請根據上下文，詳細描述圖片中的內容。"
-                "包含圖片中可見的所有文字、數據、圖表或視覺資訊。"
-                "請使用繁體中文回答。"
-            )
-        else:
-            prompt_text = (
-                "請詳細描述這張圖片的內容。"
-                "包含圖片中可見的所有文字、數據、圖表或視覺資訊。"
-                "請使用繁體中文回答。"
-            )
-
-        response = model.generate_content([
-            prompt_text,
-            {"mime_type": mime_type, "data": b64_data}
-        ])
-        description = response.text.strip()
-
-        if description:
-            logger.info(f"[image] Gemini 描述成功，{len(description)} 字元")
-            return description
-        return None
-
-    except Exception as e:
-        logger.error(f"[image] Gemini 分析錯誤: {e}")
-        return None
-
 
 
 def analyze_images(image_urls: List[str], context: str = "", config: dict = None) -> Optional[str]:

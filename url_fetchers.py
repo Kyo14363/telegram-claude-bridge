@@ -1,8 +1,4 @@
-
 ﻿"""
-=======
-"""
-
 url_fetchers.py — URL 抓取與平台解析模組
 ==========================================
 包含 URL 偵測、平台特定 fetcher、LangExtract 增強、
@@ -12,17 +8,13 @@ url_fetchers.py — URL 抓取與平台解析模組
 import os
 import re
 import asyncio
-
 import time
-=======
-
 import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Tuple
 
 logger = logging.getLogger(__name__)
-
 
 
 # --- 重試邏輯 ---
@@ -54,8 +46,6 @@ def retry_fetch(func, *args, max_retries: int = 2, backoff: float = 1.0, **kwarg
     elapsed = time.monotonic() - start
     return None, 1 + max_retries, elapsed
 
-=======
-
 # --- 可用性檢測 ---
 
 try:
@@ -80,7 +70,6 @@ except ImportError:
     REQUESTS_AVAILABLE = False
     logger.warning("requests 未安裝，URL 預處理功能將受限")
 
-
 # v3.1 P0：trafilatura 正文抽取（取代純 HTML title/desc fallback 的薄輸出）
 try:
     import trafilatura
@@ -89,8 +78,6 @@ try:
 except ImportError:
     TRAFILATURA_AVAILABLE = False
     logger.info("trafilatura 未安裝，general URL 將只能拿到 title/og:description")
-
-=======
 
 # vision 模組 — 延遲 import 避免循環依賴
 from vision import analyze_images, GENAI_AVAILABLE
@@ -108,12 +95,9 @@ PLATFORM_PATTERNS = {
         r"(?:https?://)?youtu\.be/\S+",
         r"(?:https?://)?(?:www\.)?youtube\.com/shorts/\S+",
     ],
-
     "github": [
         r"(?:https?://)?(?:www\.)?github\.com/[^/\s]+/[^/\s]+",
     ],
-=======
-
     "general": [
         r"https?://\S+",
     ],
@@ -129,11 +113,7 @@ def detect_urls(text: str) -> List[Tuple[str, str]]:
     found = []
     found_urls = set()
 
-
     for platform in ["x_twitter", "youtube", "github"]:
-=======
-    for platform in ["x_twitter", "youtube"]:
-
         for pattern in PLATFORM_PATTERNS[platform]:
             for match in re.finditer(pattern, text):
                 url = match.group(0)
@@ -285,9 +265,6 @@ def fetch_via_fxtwitter(url: str, config: dict = None) -> Optional[Tuple[str, Li
         }
 
         return result, image_urls, tweet_meta
-=======
-        return result, image_urls
-
 
     except requests.Timeout:
         logger.warning(f"[fxtwitter] 請求超時")
@@ -384,7 +361,6 @@ def fetch_via_ytdlp(url: str, config: dict = None) -> Optional[str]:
     except Exception as e:
         logger.error(f"[yt-dlp] 錯誤: {e}")
         return None
-
 
 
 # --- 方案 GitHub: GitHub API / Raw 專用 fetcher ---
@@ -577,8 +553,6 @@ def fetch_via_trafilatura(url: str, config: dict = None) -> Optional[str]:
         return None
 
 
-=======
-
 # --- 方案 fallback: 基本 HTTP 抓取 ---
 
 def fetch_via_http(url: str, config: dict = None) -> Optional[str]:
@@ -675,7 +649,6 @@ def extract_structured_data(text, prompt=None):
         return 'Extraction complete but no results'
     except Exception as e:
         return f'Extraction failed: {e}'
-
 
 
 # --- Obsidian 落地 ---
@@ -828,16 +801,11 @@ def save_to_obsidian(url: str, fetched_content: str, claude_response: str,
         logger.error(f"[obsidian] Save to Obsidian failed: {e}")
         return None
 
-=======
-# --- Fetch Output 儲存 ---
 
 def save_fetch_output(url, fetched_content, claude_response, user_note="", config: dict = None):
     """Save AI-friendly markdown summary to fetch_outputs/."""
     cfg = config or {}
-
     output_dir = cfg.get("FETCH_OUTPUT_DIR", Path("fetch_outputs"))
-=======
-    output_dir = cfg.get("FETCH_OUTPUT_DIR", Path(r"C:\telegram-MCP-bridge\fetch_outputs"))
 
     try:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -876,12 +844,8 @@ def save_fetch_output(url, fetched_content, claude_response, user_note="", confi
 
 # --- URL 預處理編排器 ---
 
-
 async def preprocess_urls(text: str, config: dict = None,
                          metrics=None) -> Tuple[str, List[str], list]:
-=======
-async def preprocess_urls(text: str, config: dict = None) -> Tuple[str, List[str]]:
-
     """
     偵測訊息中的 URL，自動抓取內容，回傳增強後的訊息。
 
@@ -890,36 +854,24 @@ async def preprocess_urls(text: str, config: dict = None) -> Tuple[str, List[str
     - YouTube/其他 yt-dlp 支援平台: yt-dlp (方案C) → http fallback
     - 其他 URL: http fallback
 
-
     回傳: (增強後的完整訊息, 處理摘要列表, obsidian_queue)
-=======
-    回傳: (增強後的完整訊息, 處理摘要列表)
-
     """
     cfg = config or {}
     urls = detect_urls(text)
 
     if not urls:
-
         return text, [], []
-=======
-        return text, []
-
 
     logger.info(f"偵測到 {len(urls)} 個 URL: {urls}")
 
     enrichments = []
     summaries = []
-
     obsidian_queue = []  # 收集需要落地 Obsidian 的內容 (url, content, meta)
     max_retries = cfg.get("FETCH_MAX_RETRIES", 2)
-=======
-
 
     for url, platform in urls:
         content = None
         method_used = None
-
         fetch_elapsed = 0.0
 
         if platform == "x_twitter":
@@ -934,17 +886,6 @@ async def preprocess_urls(text: str, config: dict = None) -> Tuple[str, List[str
                     method_used += f"(retry:{attempts})"
                 # 加入 Obsidian 落地佇列
                 obsidian_queue.append((url, content, tweet_meta))
-=======
-
-        if platform == "x_twitter":
-            # X/Twitter: fxtwitter (回傳 tuple) → yt-dlp → http
-            fxt_result = await asyncio.get_event_loop().run_in_executor(
-                None, fetch_via_fxtwitter, url, cfg
-            )
-            if fxt_result is not None:
-                content, image_urls = fxt_result
-                method_used = "fxtwitter"
-
 
                 # 層次二：通用圖片分析
                 if image_urls:
@@ -958,7 +899,6 @@ async def preprocess_urls(text: str, config: dict = None) -> Tuple[str, List[str
                     )
                     if image_descriptions:
                         content = content + "\n\n" + image_descriptions
-
                         method_used = method_used.replace("fxtwitter", "fxtwitter+img")
             else:
                 result, attempts, fetch_elapsed = await asyncio.get_event_loop().run_in_executor(
@@ -1018,33 +958,6 @@ async def preprocess_urls(text: str, config: dict = None) -> Tuple[str, List[str
 
         if content:
             # LangExtract enhancement for general URLs（trafilatura 後也可再跑，正文乾淨度更好）
-=======
-                        method_used = "fxtwitter+img"
-            else:
-                content = await asyncio.get_event_loop().run_in_executor(
-                    None, fetch_via_ytdlp, url, cfg
-                )
-                if content:
-                    method_used = "yt-dlp"
-
-        elif platform == "youtube":
-            content = await asyncio.get_event_loop().run_in_executor(
-                None, fetch_via_ytdlp, url, cfg
-            )
-            if content:
-                method_used = "yt-dlp"
-
-        # 通用 fallback
-        if not content:
-            content = await asyncio.get_event_loop().run_in_executor(
-                None, fetch_via_http, url, cfg
-            )
-            if content:
-                method_used = "http"
-
-        if content:
-            # LangExtract enhancement for general URLs
-
             if platform == "general" and LANGEXTRACT_AVAILABLE and len(content) > 300:
                 enhanced = await asyncio.get_event_loop().run_in_executor(None, enhance_with_langextract, content, url)
                 if enhanced:
@@ -1102,14 +1015,6 @@ async def preprocess_urls(text: str, config: dict = None) -> Tuple[str, List[str
                     "author_name": "",
                 }
                 obsidian_queue.append((url, fallback_content, placeholder_meta))
-=======
-            enrichments.append(content)
-            summaries.append(f"✅ {url} → {method_used}")
-            logger.info(f"URL 處理成功: {url} via {method_used}")
-        else:
-            summaries.append(f"⚠️ {url} → 無法抓取")
-            logger.warning(f"URL 處理失敗: {url}")
-
 
     # 組裝增強訊息
     if enrichments:
@@ -1121,12 +1026,6 @@ async def preprocess_urls(text: str, config: dict = None) -> Tuple[str, List[str
             f"=== 連結內容結束 ===\n"
             f"請基於上述連結內容來回應使用者的訊息。"
         )
-
         return enhanced_text, summaries, obsidian_queue
 
     return text, summaries, obsidian_queue
-=======
-        return enhanced_text, summaries
-
-    return text, summaries
-

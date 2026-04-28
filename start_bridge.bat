@@ -1,5 +1,4 @@
 @echo off
-
 setlocal
 title Telegram Claude Bridge v3.1
 
@@ -14,13 +13,6 @@ if exist ".env" (
 echo ========================================
 echo   Telegram Claude Bridge v3.1
 echo   Persistent Claude Agent SDK
-=======
-title Telegram Claude Bridge v2.6
-echo ========================================
-echo   Telegram - Claude Code Bridge v2.6
-echo   (Modular: vision + url_fetchers)
-echo   Press Ctrl+C to stop
-
 echo ========================================
 echo.
 
@@ -40,23 +32,7 @@ if errorlevel 1 goto :end
 
 python telegram_bridge_claude.py
 
-
 :end
 echo.
-=======
-REM Check google-generativeai (optional)
-python -c "import google.generativeai" >nul 2>nul
-if %ERRORLEVEL% NEQ 0 (
-    echo [Note] google-generativeai not installed. Image analysis will be disabled.
-    echo To enable: pip install google-generativeai
-)
-
-echo.
-echo [Starting] Telegram Claude Bridge v2.6...
-echo.
-
-python telegram_bridge_claude.py
-
-
 pause
 endlocal
