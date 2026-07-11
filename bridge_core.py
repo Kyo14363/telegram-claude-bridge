@@ -1,0 +1,1163 @@
+#!/usr/bin/env python3
+"""
+T-M-B Bridge Core — ClaudeBridge + CONFIG + infrastructure.
+
+Extracted from telegram_bridge_claude_v3.1.py (Phase 1 module split, 2026-05-06).
+Contains: CONFIG, logging, SDK lifecycle, ClaudeBridge class, session persistence.
+"""
+
+import os
+import sys
+import json
+import asyncio
+import subprocess
+import threading
+import re
+import glob
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional, List, Tuple
+from dataclasses import dataclass, field, asdict
+import logging
+from logging.handlers import TimedRotatingFileHandler
+
+try:
+    import psutil  # noqa: F401  — used by _terminate_descendants for /clear cleanup
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+
+# v3.1.2 Phase 1.5：CONFIG / 路徑 / Token redact / system_prompt 片段已抽至 config.py
+from config import (
+    CONFIG, VERSION, VERSION_LABEL,
+    _TokenRedactingFormatter, SYSTEM_PROMPT_APPEND,
+)
+
+
+# === 日誌設定（每日輪換）===
+def setup_logging():
+    log_file = CONFIG["LOG_DIR"] / "bridge.log"
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+
+    # v3.1.6：token 遮罩改掛 handler-level formatter（見 config.py 註解）
+    formatter = _TokenRedactingFormatter('%(asctime)s - %(levelname)s - %(message)s')
+
+    file_handler = TimedRotatingFileHandler(
+        log_file, when='midnight', interval=1,
+        backupCount=CONFIG["LOG_RETENTION_DAYS"], encoding='utf-8'
+    )
+    file_handler.suffix = "%Y-%m-%d.log"
+    # v3.1.6：自訂 suffix 加了 ".log" 但 stdlib extMatch 只認 "%Y-%m-%d"，
+    # getFilesToDelete() 的 fullmatch 永遠失敗 → backupCount 從未刪檔
+    # （2026-06-10 實測：128 個 log 檔回溯 4 個月）。extMatch 必須與 suffix 同步。
+    file_handler.extMatch = re.compile(r"^\d{4}-\d{2}-\d{2}\.log$", re.ASCII)
+    file_handler.setFormatter(formatter)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(console_handler)
+
+    # v3.1.6：httpx 每 10s 一行 getUpdates INFO（含完整 bot URL）＝主要洩漏源 + 噪音
+    # （~8,600 行/日）。降到 WARNING：錯誤仍可見，常態 polling 不進 log。
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    return logging.getLogger(__name__)
+
+def cleanup_old_logs():
+    cutoff_date = datetime.now() - timedelta(days=CONFIG["LOG_RETENTION_DAYS"])
+    log_pattern = CONFIG["LOG_DIR"] / "bridge.log.*"
+    deleted_count = 0
+    for log_file in glob.glob(str(log_pattern)):
+        # v3.1.6：舊解析 split('.')[-1] 對 "bridge.log.2026-02-02.log" 取到 "log"
+        # 而非日期 → strptime 必拋 ValueError → 從未刪過任何檔。改用 regex 直取日期，
+        # 同時相容有/無 ".log" 結尾兩種命名。
+        m = re.search(r"bridge\.log\.(\d{4}-\d{2}-\d{2})(?:\.log)?$", log_file)
+        if not m:
+            continue
+        try:
+            file_date = datetime.strptime(m.group(1), "%Y-%m-%d")
+            if file_date < cutoff_date:
+                os.remove(log_file)
+                deleted_count += 1
+        except (ValueError, OSError):
+            continue
+    if deleted_count > 0:
+        logging.info(f"已清理 {deleted_count} 個超過 {CONFIG['LOG_RETENTION_DAYS']} 天的舊 log 檔案")
+
+logger = setup_logging()
+
+# === 外部模組 ===
+try:
+    from claude_agent_sdk import (
+        ClaudeSDKClient, ClaudeAgentOptions,
+        AssistantMessage, UserMessage, SystemMessage, ResultMessage,
+        TextBlock, ToolUseBlock, ToolResultBlock, ThinkingBlock,
+    )
+    SDK_AVAILABLE = True
+except ImportError:
+    SDK_AVAILABLE = False
+
+from url_fetchers import (
+    detect_urls, preprocess_urls, save_fetch_output, save_to_obsidian,
+    extract_structured_data,
+    REQUESTS_AVAILABLE, YTDLP_AVAILABLE, LANGEXTRACT_AVAILABLE,
+)
+from vision import GENAI_AVAILABLE
+from reply_fetcher import (
+    detect_reply_keywords, extract_tweet_id,
+    fetch_tweet_replies, filter_replies_with_ai,
+    format_replies_for_obsidian, format_replies_for_prompt,
+    TWIKIT_AVAILABLE,
+)
+from metrics import Metrics, Timer
+
+
+# === 對話歷史 ===
+
+@dataclass
+class Message:
+    role: str
+    content: str
+    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+
+class ConversationHistory:
+    def __init__(self, max_rounds: int = 10):
+        self.max_messages = max_rounds * 2
+        self.messages: List[Message] = []
+
+    def add_user_message(self, content: str) -> None:
+        self.messages.append(Message(role="user", content=content))
+        self._trim()
+
+    def add_assistant_message(self, content: str) -> None:
+        self.messages.append(Message(role="assistant", content=content))
+        self._trim()
+
+    def _trim(self) -> None:
+        while len(self.messages) > self.max_messages:
+            self.messages.pop(0)
+
+    def clear(self) -> None:
+        self.messages.clear()
+        logger.info("本地參考歷史已清空")
+
+    def save(self, filepath: Path) -> None:
+        try:
+            filepath.parent.mkdir(parents=True, exist_ok=True)
+            data = {"messages": [asdict(m) for m in self.messages], "saved_at": datetime.now().isoformat()}
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"保存歷史失敗: {e}")
+
+    @classmethod
+    def load(cls, filepath: Path, max_rounds: int = 10):
+        history = cls(max_rounds=max_rounds)
+        try:
+            if filepath.exists():
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                for msg_data in data.get("messages", []):
+                    history.messages.append(Message(**msg_data))
+                logger.info(f"已載入 {len(history.messages)} 條本地參考歷史")
+        except Exception as e:
+            logger.error(f"載入歷史失敗: {e}")
+        return history
+
+
+# === Playwright 回覆抓取 fallback (v3.1) ===
+
+def _build_playwright_reply_fallback(tweet_url: str, user_criteria: str, twikit_err: str) -> str:
+    criteria = f"\n篩選條件：「{user_criteria}」" if user_criteria else ""
+    return f"""
+
+=== twikit 抓取失敗 → Playwright fallback ===
+twikit 錯誤：{twikit_err}
+
+請改用 mcp__playwright__browser_* 工具完成以下任務：
+1. 導航到 {tweet_url}（使用既有已登入的 X/Twitter session）
+2. 等待頁面載入；若有「顯示更多回覆」按鈕請點開（最多展 3 次）
+3. 從 DOM 提取最多 30 則最有價值的回覆，每則含：
+   - 作者 handle（@xxx）
+   - 內文
+   - 按讚數（若可見）
+4. 自動排除純 emoji、純附和、廣告/spam{criteria}
+5. 整理成繁體中文 markdown 區塊（### 1. **作者** (@handle) → 內文 → ❤️ 數）
+6. 完成後（除非還有後續任務）呼叫 mcp__playwright__browser_close 釋放資源
+
+如此頁面不存在或登入失效，回報具體狀況不要硬撐。
+=== fallback 結束 ===
+"""
+
+
+# v3.1.6 P2：Playwright 瀏覽器進程名（psutil 直接關閉用）。
+# 只在 SDK claude.exe 子樹內比對 — 使用者自己的桌面 Chrome 不在樹內，不會誤殺。
+_BROWSER_PROC_NAMES = ("chrome.exe", "chromium.exe", "msedge.exe", "headless_shell.exe", "firefox.exe")
+
+
+# v3.1.6 P1+P2：彈回訊息統一為常數。P2 起忙碌訊息改走 FIFO 佇列
+# （asyncio.Lock 的 waiter 順序即佇列），只有佇列滿了才彈回。
+# handle_message 靠比對此字串跳過 save_fetch_output / save_to_obsidian / 歷史寫入 —
+# 沒有這層兜底，彈回字串會被當成「Claude 初步分析」寫進 Obsidian。
+BUSY_BOUNCE_MSG = "Claude 任務佇列已滿，請稍後再試（或用 /interrupt 中斷當前任務）..."
+
+
+# === Session 狀態持久化 ===
+
+def load_session_id() -> Optional[str]:
+    fp = CONFIG["SESSION_STATE_FILE"]
+    if not fp.exists():
+        return None
+    try:
+        with open(fp, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        sid = data.get("session_id")
+        if sid:
+            logger.info(f"載入既有 session_id: {sid[:12]}...")
+        return sid
+    except Exception as e:
+        logger.warning(f"無法讀取 session_state.json: {e}")
+        return None
+
+def save_session_id(session_id: str) -> None:
+    fp = CONFIG["SESSION_STATE_FILE"]
+    try:
+        data = {
+            "session_id": session_id,
+            "saved_at": datetime.now().isoformat(),
+        }
+        with open(fp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"無法寫入 session_state.json: {e}")
+
+def clear_session_state() -> None:
+    fp = CONFIG["SESSION_STATE_FILE"]
+    if fp.exists():
+        try:
+            fp.unlink()
+            logger.info("session_state.json 已刪除")
+        except Exception as e:
+            logger.warning(f"刪除 session_state.json 失敗: {e}")
+
+
+# === 主橋接器 ===
+
+class ClaudeBridge:
+    def __init__(self):
+        self.history = ConversationHistory.load(CONFIG["HISTORY_FILE"], CONFIG["MAX_HISTORY_ROUNDS"])
+        self.is_busy = False
+        self._exec_lock = asyncio.Lock()
+        # v3.1.6 P2：排隊中（等鎖、未執行）的任務數。只在主 loop 上增減，無 race。
+        self._queue_waiting = 0
+        self.metrics = Metrics(CONFIG["BASE_DIR"] / "stats.json")
+        self.sdk_client: Optional[ClaudeSDKClient] = None
+        self.current_session_id: Optional[str] = load_session_id()
+        self._sdk_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._sdk_thread: Optional[threading.Thread] = None
+        self._main_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._last_browser_activity: float = 0.0
+        self._idle_watchdog_task: Optional[asyncio.Task] = None
+        # v3.2.3：活性心跳 task（主 loop 上；卡死偵測的訊號源）
+        self._heartbeat_task: Optional[asyncio.Task] = None
+        # v3.2.2：移除 /session（與 /status 重疊 80%，session 完整資訊已併入）
+        # 與 /history（v3.0 起 context 由 SDK 自管；ConversationHistory 類別保留
+        # 供 photo handler 的 Gemini context fallback 使用，僅指令出口移除）
+        self.special_commands = {
+            "/clear": self._cmd_clear,
+            "/help": self._cmd_help,
+            "/status": self._cmd_status,
+            "/stats": self._cmd_stats,
+            "/interrupt": self._cmd_interrupt,
+            "/browser-close": self._cmd_browser_close,
+            "/keyboard": self._cmd_keyboard,
+        }
+
+    def is_authorized(self, user_id: int) -> bool:
+        if not CONFIG["ALLOWED_USER_IDS"]:
+            return True
+        return user_id in CONFIG["ALLOWED_USER_IDS"]
+
+    # --- SDK 生命週期 ---
+
+    def _build_options(self, resume_id: Optional[str] = None) -> ClaudeAgentOptions:
+        cli_path = CONFIG.get("CLAUDE_CLI_PATH")
+        if cli_path and not Path(cli_path).exists():
+            logger.warning(f"指定的 claude CLI 不存在: {cli_path}，將回退到 SDK bundled 版本（可能未登入）")
+            cli_path = None
+
+        def _cli_stderr(line: str) -> None:
+            line = (line or "").rstrip()
+            if line:
+                logger.error(f"[CLI stderr] {line}")
+
+        return ClaudeAgentOptions(
+            cwd=str(CONFIG["WORKING_DIR"]),
+            model=CONFIG["SDK_MODEL"],
+            permission_mode=CONFIG["SDK_PERMISSION_MODE"],
+            setting_sources=CONFIG["SDK_SETTING_SOURCES"],
+            skills=CONFIG["SDK_SKILLS"],
+            resume=resume_id,
+            system_prompt={
+                "type": "preset",
+                "preset": "claude_code",
+                # 結構化片段組裝於 config.py：
+                # Browser autoclose + Provenance protocol + Editorial triage (v3.3.3)
+                # + Telegram output style (v3.1.2 P2)
+                "append": SYSTEM_PROMPT_APPEND,
+            },
+            include_partial_messages=False,
+            cli_path=str(cli_path) if cli_path else None,
+            stderr=_cli_stderr,
+        )
+
+    # --- 跨 loop 派送 ---
+
+    def _ensure_sdk_thread(self) -> None:
+        if self._sdk_thread and self._sdk_thread.is_alive():
+            return
+        ready = threading.Event()
+
+        def _run():
+            if sys.platform == "win32":
+                loop = asyncio.ProactorEventLoop()
+            else:
+                loop = asyncio.new_event_loop()
+            self._sdk_loop = loop
+            asyncio.set_event_loop(loop)
+            ready.set()
+            try:
+                loop.run_forever()
+            finally:
+                loop.close()
+
+        self._sdk_thread = threading.Thread(target=_run, daemon=True, name="SDKLoop")
+        self._sdk_thread.start()
+        ready.wait(timeout=10)
+        if not self._sdk_loop:
+            raise RuntimeError("SDK thread 啟動失敗")
+        logger.info(f"SDK 專屬 thread 已啟動（loop={type(self._sdk_loop).__name__}）")
+
+    async def _submit_to_sdk(self, coro) -> any:
+        if not self._sdk_loop:
+            raise RuntimeError("SDK loop 尚未啟動")
+        fut = asyncio.run_coroutine_threadsafe(coro, self._sdk_loop)
+        return await asyncio.wrap_future(fut)
+
+    # --- SDK 生命週期 ---
+
+    async def start_sdk(self) -> None:
+        if not SDK_AVAILABLE:
+            raise RuntimeError("claude-agent-sdk 未安裝。請執行 pip install claude-agent-sdk")
+        self._main_loop = asyncio.get_running_loop()
+        # v3.2.3：心跳先於 SDK 連線啟動 — SDK 失敗時 bridge 以受限模式續跑，
+        # 活性訊號（heartbeat.txt + 每小時 [hb] log）仍必須存在
+        if self._heartbeat_task is None or self._heartbeat_task.done():
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        self._ensure_sdk_thread()
+        await self._submit_to_sdk(self._sdk_connect_impl(self.current_session_id))
+        if self._idle_watchdog_task is None or self._idle_watchdog_task.done():
+            self._idle_watchdog_task = asyncio.create_task(self._idle_watchdog_loop())
+
+    async def _sdk_connect_impl(self, resume_id: Optional[str]) -> None:
+        options = self._build_options(resume_id=resume_id)
+        self.sdk_client = ClaudeSDKClient(options=options)
+        try:
+            await self.sdk_client.connect()
+            logger.info(f"Claude SDK 已連線（resume={resume_id[:12] + '...' if resume_id else 'new session'}）")
+        except Exception as e:
+            import traceback
+            logger.error(f"SDK 連線失敗（resume_id={resume_id}）: {type(e).__name__}: {e}")
+            logger.error(f"Traceback:\n{traceback.format_exc()}")
+            if resume_id:
+                logger.info("嘗試以新 session 重新連線...")
+                self.current_session_id = None
+                clear_session_state()
+                options = self._build_options(resume_id=None)
+                self.sdk_client = ClaudeSDKClient(options=options)
+                try:
+                    await self.sdk_client.connect()
+                    logger.info("Claude SDK 已連線（new session）")
+                except Exception as e2:
+                    logger.error(f"新 session 連線也失敗: {type(e2).__name__}: {e2}")
+                    logger.error(f"Traceback:\n{traceback.format_exc()}")
+                    raise
+            else:
+                raise
+
+    async def stop_sdk(self) -> None:
+        if self._heartbeat_task and not self._heartbeat_task.done():
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if self._idle_watchdog_task and not self._idle_watchdog_task.done():
+            self._idle_watchdog_task.cancel()
+            try:
+                await self._idle_watchdog_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        # v3.1.5：先抓 PID，disconnect 後若仍有 claude.exe 子樹用 psutil 收乾淨
+        old_pid = self._capture_sdk_subprocess_pid()
+        if self.sdk_client and self._sdk_loop:
+            try:
+                await self._submit_to_sdk(self._sdk_disconnect_impl())
+                logger.info("Claude SDK 已斷線")
+            except Exception as e:
+                logger.warning(f"SDK 斷線時錯誤: {e}")
+        if old_pid is not None:
+            self._terminate_descendants(old_pid)
+        if self._sdk_loop and self._sdk_loop.is_running():
+            self._sdk_loop.call_soon_threadsafe(self._sdk_loop.stop)
+
+    def _capture_sdk_subprocess_pid(self) -> Optional[int]:
+        if not self.sdk_client:
+            return None
+        # Primary：戳 SDK 私有屬性 _transport._process.pid
+        try:
+            transport = getattr(self.sdk_client, "_transport", None)
+            if transport is not None:
+                proc = getattr(transport, "_process", None)
+                if proc is not None:
+                    return proc.pid
+        except Exception:
+            pass
+        # Fallback（v3.1.5）：psutil 找 bridge process 底下最年輕的 claude.exe
+        # 用途：未來 SDK 升級若改了 _transport._process 路徑，primary 會回 None，
+        # 此時靠 psutil 仍能定位當前 SDK 的 claude.exe 以便 _terminate_descendants
+        if not PSUTIL_AVAILABLE:
+            return None
+        try:
+            import psutil
+            me = psutil.Process(os.getpid())
+            candidates = [
+                c for c in me.children(recursive=False)
+                if "claude" in c.name().lower()
+            ]
+            if not candidates:
+                return None
+            candidates.sort(key=lambda c: c.create_time(), reverse=True)
+            pid = candidates[0].pid
+            logger.info(f"[capture_pid] SDK 內部探測失敗，psutil fallback 取得 claude.exe pid={pid}")
+            return pid
+        except Exception as e:
+            logger.debug(f"[capture_pid] psutil fallback 失敗: {e}")
+            return None
+
+    @staticmethod
+    def _terminate_descendants(parent_pid: Optional[int], grace_sec: float = 3.0) -> int:
+        if not PSUTIL_AVAILABLE or parent_pid is None:
+            return 0
+        try:
+            import psutil
+            try:
+                parent = psutil.Process(parent_pid)
+            except psutil.NoSuchProcess:
+                return 0
+            descendants = parent.children(recursive=True)
+            if not descendants:
+                return 0
+            for p in descendants:
+                try:
+                    p.terminate()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            gone, alive = psutil.wait_procs(descendants, timeout=grace_sec)
+            for p in alive:
+                try:
+                    p.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            killed = len(descendants)
+            logger.info(f"[clear] 清掃 SDK 子進程後代：{killed} 個 (claude.exe pid={parent_pid})")
+            return killed
+        except Exception as e:
+            logger.warning(f"[clear] descendants 清掃異常（不影響主流程）: {e}")
+            return 0
+
+    async def _sdk_disconnect_impl(self) -> None:
+        if self.sdk_client:
+            await self.sdk_client.disconnect()
+            self.sdk_client = None
+
+    async def restart_sdk_with_new_session(self) -> None:
+        # v3.1.5：完整 teardown 舊 SDK loop/thread 後再建立全新的，避免
+        # 在同一個 ProactorEventLoop 上做 disconnect→connect 導致 anyio
+        # cancellation 與新 task group 互鎖、SDKLoop 卡 busy loop（曾觀測到
+        # python.exe 持續 108% 單核）。
+        watchdog_was_running = (
+            self._idle_watchdog_task is not None and not self._idle_watchdog_task.done()
+        )
+        if watchdog_was_running:
+            self._idle_watchdog_task.cancel()
+            try:
+                await self._idle_watchdog_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        old_pid = self._capture_sdk_subprocess_pid()
+        old_loop = self._sdk_loop
+        old_thread = self._sdk_thread
+
+        # 1. Best-effort graceful disconnect（短 timeout，卡住就放棄走強制 teardown）
+        if self.sdk_client and old_loop is not None:
+            try:
+                await asyncio.wait_for(
+                    self._submit_to_sdk(self._sdk_disconnect_impl()),
+                    timeout=2.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("[clear] 舊 SDK disconnect 逾時 2s（將強制 teardown）")
+            except Exception as e:
+                logger.warning(f"[clear] 舊 SDK disconnect 失敗（將強制 teardown）: {type(e).__name__}: {e}")
+
+        # 2. 殺舊 claude.exe 子樹
+        if old_pid is not None:
+            self._terminate_descendants(old_pid)
+
+        # 3. 停舊 loop、等舊 thread 結束（join 逾時不阻擋；舊 thread 是 daemon）
+        if old_loop is not None and old_loop.is_running():
+            try:
+                old_loop.call_soon_threadsafe(old_loop.stop)
+            except Exception as e:
+                logger.warning(f"[clear] 舊 SDK loop stop 失敗（忽略）: {type(e).__name__}: {e}")
+        if old_thread is not None:
+            old_thread.join(timeout=3.0)
+            if old_thread.is_alive():
+                logger.warning(
+                    "[clear] 舊 SDK thread 未在 3s 內結束，以 daemon 方式遺棄；"
+                    "新 thread 獨立不受影響"
+                )
+
+        # 4. 重置 state — _ensure_sdk_thread() 必須看到 None 才會建新 thread
+        self._sdk_loop = None
+        self._sdk_thread = None
+        self.sdk_client = None
+        self.current_session_id = None
+        clear_session_state()
+        self._last_browser_activity = 0.0
+
+        # 5. 全新 thread + 全新 ProactorEventLoop + 新 SDK session
+        self._ensure_sdk_thread()
+        await self._submit_to_sdk(self._sdk_connect_impl(resume_id=None))
+        logger.info("Claude SDK 已啟動全新 session（thread+loop 已完整 teardown 重建）")
+
+        if watchdog_was_running:
+            self._idle_watchdog_task = asyncio.create_task(self._idle_watchdog_loop())
+
+    # --- 指令 ---
+
+    async def _cmd_clear(self, chat_id: int) -> str:
+        self.history.clear()
+        self.history.save(CONFIG["HISTORY_FILE"])
+        try:
+            await self.restart_sdk_with_new_session()
+            return "已啟動全新 Claude session。先前的 todos / plan mode / 檔案 context 已重置。"
+        except Exception as e:
+            logger.error(f"重啟 SDK 失敗: {e}")
+            return f"清空成功但 SDK 重啟失敗：{e}"
+
+    async def _cmd_interrupt(self, chat_id: int) -> str:
+        if not self.sdk_client:
+            return "SDK 未連線。"
+        try:
+            await self._submit_to_sdk(self._interrupt_only())
+            return "已送出中斷訊號（Claude 會在當前 tool 結束後停止）。"
+        except Exception as e:
+            return f"中斷失敗：{e}"
+
+    async def _interrupt_only(self) -> None:
+        if self.sdk_client:
+            await self.sdk_client.interrupt()
+
+    def _close_browser_processes(self) -> int:
+        """v3.1.6 P2：psutil 直接終結 SDK claude.exe 子樹下的 Playwright 瀏覽器。
+
+        取代「派 query 請 Claude 呼叫 browser_close」的舊路徑 — 舊路徑每次
+        燒一輪模型呼叫，且行政訊息會累積在長 session 的 context 裡。
+        cookies 在磁碟（user-data-dir）不受影響；MCP server 端若殘留 stale
+        handle，下次 browser_navigate 會自動重啟或報錯一次（/clear 為兜底）。
+
+        回傳殺掉的進程數；psutil 不可用或找不到 SDK 進程回 -1（呼叫端走舊路徑）。
+        """
+        if not PSUTIL_AVAILABLE:
+            return -1
+        root_pid = self._capture_sdk_subprocess_pid()
+        if root_pid is None:
+            return -1
+        try:
+            import psutil
+            root = psutil.Process(root_pid)
+            browsers = [
+                p for p in root.children(recursive=True)
+                if p.name().lower() in _BROWSER_PROC_NAMES
+            ]
+            if not browsers:
+                return 0
+            for p in browsers:
+                try:
+                    p.terminate()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            gone, alive = psutil.wait_procs(browsers, timeout=3.0)
+            for p in alive:
+                try:
+                    p.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            logger.info(f"[browser] psutil 關閉瀏覽器進程 {len(browsers)} 個（root claude.exe pid={root_pid}）")
+            return len(browsers)
+        except Exception as e:
+            logger.warning(f"[browser] psutil 關閉失敗，將 fallback 舊路徑: {e}")
+            return -1
+
+    async def _cmd_browser_close(self, chat_id: int) -> str:
+        killed = self._close_browser_processes()
+        if killed >= 0:
+            self._last_browser_activity = 0.0
+            if killed > 0:
+                return (f"🛑 已直接關閉 Playwright 瀏覽器進程（{killed} 個）。"
+                        f"cookies 保留，下次需要時自動重啟。")
+            return "目前沒有偵測到 Playwright 瀏覽器進程。"
+        # psutil 路徑不可用 → 舊路徑：派 query 請 Claude 關（燒一次模型呼叫）
+        if not self.sdk_client:
+            return "SDK 未連線。"
+        prompt = (
+            "Please call mcp__playwright__browser_close to close all open Playwright "
+            "browsers right now to free CPU/memory. Reply with one short Chinese sentence "
+            "confirming success or stating no browser was open."
+        )
+        try:
+            resp = await self.execute_claude(prompt, progress_cb=None, photo_cb=None)
+            self._last_browser_activity = 0.0
+            return f"🛑 已請 Claude 關閉瀏覽器：\n{resp}"
+        except Exception as e:
+            return f"關閉失敗：{e}"
+
+    async def _cmd_keyboard(self, chat_id: int) -> str:
+        return "⌨️ 鍵盤已重新顯示。"
+
+    # --- 活性心跳（v3.2.3）---
+
+    async def _heartbeat_loop(self) -> None:
+        """每 HEARTBEAT_FILE_SEC 秒 touch heartbeat.txt（TMB_Watchdog 據此判定
+        「進程在但 event loop 卡死」→ 殺掉重啟），每 HEARTBEAT_LOG_SEC 秒寫一行
+        [hb] INFO。心跳跑在主 PTB loop 上 — 主 loop 卡死＝心跳停＝watchdog 出手；
+        網路斷線但 loop 活著的情況由 error_handler 的 WARNING 負責呈現。"""
+        file_interval = CONFIG.get("HEARTBEAT_FILE_SEC", 300)
+        log_every = max(1, CONFIG.get("HEARTBEAT_LOG_SEC", 3600) // file_interval)
+        hb_file = CONFIG["LOG_DIR"] / "heartbeat.txt"
+        tick = 0
+        while True:
+            try:
+                hb_file.write_text(datetime.now().isoformat(), encoding="utf-8")
+                if tick % log_every == 0:
+                    sdk_state = "ok" if self.sdk_client else "down"
+                    logger.info(f"[hb] alive | busy={self.is_busy} queue={self._queue_waiting} sdk={sdk_state}")
+                tick += 1
+                await asyncio.sleep(file_interval)
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.warning(f"[hb] 心跳異常（續跑）: {e}")
+                await asyncio.sleep(file_interval)
+
+    # --- 閒置 watchdog ---
+
+    async def _idle_watchdog_loop(self) -> None:
+        check_interval = CONFIG.get("BROWSER_IDLE_CHECK_SEC", 60)
+        idle_min = CONFIG.get("BROWSER_IDLE_CLOSE_MIN", 5)
+        threshold_sec = idle_min * 60
+        logger.info(f"[idle] watchdog 啟動：每 {check_interval}s 檢查，閾值 {idle_min} 分鐘")
+        while True:
+            try:
+                await asyncio.sleep(check_interval)
+                if self._last_browser_activity <= 0:
+                    continue
+                if self._exec_lock.locked():
+                    continue
+                now = asyncio.get_running_loop().time()
+                idle_for = now - self._last_browser_activity
+                if idle_for >= threshold_sec:
+                    logger.info(f"[idle] Playwright 閒置 {idle_for:.0f}s ≥ {threshold_sec}s，自動關閉")
+                    # v3.1.6 P2：優先 psutil 直接關（零模型呼叫、不污染 session context）
+                    killed = self._close_browser_processes()
+                    if killed >= 0:
+                        self._last_browser_activity = 0.0
+                        logger.info(f"[idle] psutil 自動關閉完成（{killed} 個進程）")
+                        continue
+                    # psutil 不可用 → 舊路徑
+                    try:
+                        await self.execute_claude(
+                            "Silently call mcp__playwright__browser_close. "
+                            "Reply with just the word 'closed' or nothing.",
+                            progress_cb=None,
+                            photo_cb=None,
+                        )
+                        self._last_browser_activity = 0.0
+                        logger.info("[idle] 自動關閉 Playwright browser 完成（Claude 路徑）")
+                    except Exception as e:
+                        logger.warning(f"[idle] 自動關閉失敗: {e}")
+            except asyncio.CancelledError:
+                logger.info("[idle] watchdog 結束")
+                return
+            except Exception as e:
+                logger.warning(f"[idle] watchdog 異常: {e}")
+
+    async def _cmd_help(self, chat_id: int) -> str:
+        url_status = []
+        url_status.append(f"  fxtwitter (X/Twitter): {'✅ 可用' if REQUESTS_AVAILABLE else '❌ 需要 requests'}")
+        url_status.append(f"  yt-dlp (YouTube/通用): {'✅ 可用' if YTDLP_AVAILABLE else '❌ 未安裝'}")
+        url_status.append(f"  HTTP fallback: {'✅ 可用' if REQUESTS_AVAILABLE else '❌ 需要 requests'}")
+        url_block = "\n".join(url_status)
+
+        img_enabled = CONFIG.get("IMAGE_ANALYSIS_ENABLED", False)
+        if img_enabled and GENAI_AVAILABLE:
+            img_status = f"✅ 啟用（Gemini，最多 {CONFIG['MAX_IMAGES_PER_MESSAGE']} 張/訊息）"
+        elif img_enabled:
+            img_status = "⚠️ 設定啟用但 Gemini 不可用"
+        else:
+            img_status = "❌ 停用"
+
+        return f"""{VERSION_LABEL} 指令說明
+
+🆕 v3.0：常駐 Claude Agent SDK，跨訊息保留 plan mode/todos/檔案 context/MCP server 連線
+
+特殊指令：
+/clear - 啟動全新 Claude session（重置所有上下文）
+/interrupt - 中斷正在跑的 Claude 任務
+/browser-close - 立即關閉 Playwright Chrome 釋放資源
+/keyboard - 重新顯示快捷鍵盤
+/status - 顯示系統狀態（含 SDK session 完整資訊）
+/stats - 顯示使用指標
+/help - 顯示此幫助訊息
+/exec <cmd> - 直接執行 PowerShell 命令（不經 Claude；不在快捷鍵盤上避免誤觸）
+/resume [--force] <指令> - 接續桌面最近那條 Claude Code session（headless，續同一份 context/todos、落回原專案夾）。與常駐 SDK 是不同對象；會計費、不在快捷鍵盤上。桌面 session 可能還開著時會擋，加 --force 略過
+/handoff <指令> - 讀桌面最近那條 session 的尾巴做成 briefing，交給常駐 B（替身）接手。與 /resume 互補：B 記憶不完整但有串流、免 CLI 登入；只讀不寫，桌面那條還開著也能安全交棒。不在快捷鍵盤上
+
+Shortcut（直接 PowerShell）：
+/ps /cclog /tasklog /bridge /uptime
+
+🆕 v3.1 變更：
+• /fetch /extract 已廢除 — 直接傳 URL 即可，Claude 自己會用最佳工具
+• twikit 失敗自動 fallback 到 Playwright（不再受困於 transaction.py 維護）
+• Playwright 截圖同時推到 Telegram + 嵌入 Obsidian 筆記
+
+🆕 v3.0 既有：
+• 截圖直接以 Telegram 圖片回傳
+• Playwright Chrome 閒置 5 分鐘自動關閉省電
+• 12 鍵持久化快捷鍵盤（手機輸入區下方）
+
+一般使用：
+直接輸入訊息與 Claude 對話。session 跨訊息延續，
+重啟 bridge 後也能 resume 同一條工作線（透過 session_state.json）。
+
+🔗 URL 自動處理：
+- X/Twitter → fxtwitter API → yt-dlp（備用）
+- YouTube → yt-dlp
+- 其他網站 → HTTP 抓取 + LangExtract 增強
+
+📷 圖片分析：自動下載推文/Telegram 圖片並透過 Gemini Vision 分析
+
+💬 回覆抓取（關鍵字觸發）：
+觸發詞: {', '.join(CONFIG.get('REPLY_KEYWORDS', []))}
+- twikit: {'✅ 可用' if TWIKIT_AVAILABLE else '❌ 未安裝'}
+
+URL 處理器狀態：
+{url_block}
+
+📷 圖片分析: {img_status}
+"""
+
+    async def _cmd_status(self, chat_id: int) -> str:
+        log_files = list(CONFIG["LOG_DIR"].glob("bridge.log*"))
+        status = "忙碌中" if self.is_busy else "待命"
+        sdk_status = "✅ 已連線" if self.sdk_client else "❌ 未連線"
+        # v3.2.2：/session 併入此處 — 顯示完整 session ID + Skills + Setting sources
+        sid = self.current_session_id or "(尚未建立，下次對話後產生)"
+
+        if CONFIG.get("IMAGE_ANALYSIS_ENABLED"):
+            img_status = f"✅ 啟用（最多 {CONFIG['MAX_IMAGES_PER_MESSAGE']} 張/訊息）" if GENAI_AVAILABLE else "⚠️ 啟用但 Gemini 不可用"
+        else:
+            img_status = "❌ 停用"
+
+        return f"""系統狀態 (v{VERSION})
+SDK 連線: {sdk_status}
+Session ID: {sid}
+模型: {CONFIG['SDK_MODEL']}
+Permission: {CONFIG['SDK_PERMISSION_MODE']}
+Skills: {CONFIG['SDK_SKILLS']}
+Setting sources: {', '.join(CONFIG['SDK_SETTING_SOURCES'])}
+工作目錄: {CONFIG['WORKING_DIR']}
+Log 目錄: {CONFIG['LOG_DIR']}
+Log 檔案數: {len(log_files)}
+Claude 狀態: {status}
+
+URL 處理器:
+  fxtwitter: {'✅' if REQUESTS_AVAILABLE else '❌'}
+  yt-dlp: {'✅' if YTDLP_AVAILABLE else '❌'}
+
+📷 圖片分析: {img_status}
+💬 回覆抓取: {'✅ twikit 可用' if TWIKIT_AVAILABLE else '❌ twikit 未安裝'}
+
+當前時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+
+    async def _cmd_stats(self, chat_id: int) -> str:
+        return self.metrics.get_summary()
+
+    # --- Claude 執行（v3.0 SDK 版）---
+
+    async def execute_claude(
+        self,
+        prompt: str,
+        progress_cb: Optional[callable] = None,
+        photo_cb: Optional[callable] = None,
+        screenshot_collector: Optional[List[Tuple[bytes, str]]] = None,
+    ) -> str:
+        if not self.sdk_client:
+            return "SDK 未連線。請檢查 bridge log。"
+        # v3.1.6 P2：忙碌時排隊（FIFO ＝ asyncio.Lock waiter 順序），滿了才彈回
+        if self._exec_lock.locked() and self._queue_waiting >= CONFIG.get("QUEUE_MAX_WAITING", 2):
+            return BUSY_BOUNCE_MSG
+
+        self._queue_waiting += 1
+        acquired = False
+        try:
+            await self._exec_lock.acquire()
+            acquired = True
+            self._queue_waiting -= 1
+            return await self._execute_claude_locked(prompt, progress_cb, photo_cb, screenshot_collector)
+        finally:
+            if acquired:
+                self._exec_lock.release()
+            else:
+                # 等鎖期間被 cancel（如 bridge shutdown）— 計數要還
+                self._queue_waiting -= 1
+
+    async def _execute_claude_locked(
+        self,
+        prompt: str,
+        progress_cb: Optional[callable],
+        photo_cb: Optional[callable] = None,
+        screenshot_collector: Optional[List[Tuple[bytes, str]]] = None,
+    ) -> str:
+        self.is_busy = True
+        timer = Timer().start()
+        text_chunks: List[str] = []
+
+        main_loop = self._main_loop
+
+        def _proxy_progress(text: str):
+            if not progress_cb or not main_loop:
+                return
+            try:
+                asyncio.run_coroutine_threadsafe(progress_cb(text), main_loop)
+            except Exception as cb_e:
+                logger.debug(f"progress_cb 派送失敗: {cb_e}")
+
+        def _proxy_photo(data: bytes, media_type: str):
+            if not photo_cb or not main_loop:
+                return
+            try:
+                asyncio.run_coroutine_threadsafe(photo_cb(data, media_type), main_loop)
+            except Exception as cb_e:
+                logger.debug(f"photo_cb 派送失敗: {cb_e}")
+
+        try:
+            logger.info(f"[SDK] 送出 query: {prompt[:120]}...")
+            await asyncio.wait_for(
+                self._submit_to_sdk(self._run_query_on_sdk(
+                    prompt, text_chunks, _proxy_progress, _proxy_photo, screenshot_collector
+                )),
+                timeout=CONFIG["TIMEOUT"],
+            )
+
+            full_text = "".join(text_chunks).strip() or "(任務完成，無文字輸出)"
+            self.metrics.record_claude_call(timer.elapsed(), success=True)
+            return self._format_output(full_text)
+
+        except asyncio.TimeoutError:
+            self.metrics.record_claude_call(timer.elapsed(), success=False)
+            self.metrics.record_error("claude", f"timeout ({CONFIG['TIMEOUT']}s)")
+            try:
+                if self.sdk_client:
+                    await self._submit_to_sdk(self._interrupt_and_drain())
+            except Exception as e:
+                logger.warning(f"interrupt/drain 失敗: {e}")
+            partial = "".join(text_chunks).strip()
+            return f"執行超時（{CONFIG['TIMEOUT']}秒）。已送出 interrupt。\n\n部分輸出：\n{partial}" if partial else f"執行超時（{CONFIG['TIMEOUT']}秒）"
+        except Exception as e:
+            import traceback
+            logger.error(f"Claude SDK 執行錯誤：{type(e).__name__}: {e}")
+            logger.error(f"Traceback:\n{traceback.format_exc()}")
+            self.metrics.record_claude_call(timer.elapsed(), success=False)
+            self.metrics.record_error("claude", f"{type(e).__name__}: {e}")
+            partial = "".join(text_chunks).strip()
+            err_line = f"執行錯誤：{type(e).__name__}: {str(e)}"
+            return (partial + "\n\n---\n" + err_line) if partial else err_line
+        finally:
+            self.is_busy = False
+
+    async def _run_query_on_sdk(
+        self,
+        prompt: str,
+        text_chunks: List[str],
+        proxy_progress,
+        proxy_photo=None,
+        screenshot_collector: Optional[List[Tuple[bytes, str]]] = None,
+    ) -> None:
+        import base64
+        await self.sdk_client.query(prompt)
+        async for msg in self.sdk_client.receive_response():
+            if isinstance(msg, AssistantMessage):
+                for block in msg.content:
+                    if isinstance(block, TextBlock):
+                        text_chunks.append(block.text)
+                    elif isinstance(block, ToolUseBlock):
+                        hint = self._summarize_tool_use(block)
+                        logger.info(f"[SDK] tool_use: {hint}")
+                        proxy_progress(f"🔧 {hint}")
+                        if block.name and block.name.startswith("mcp__playwright__"):
+                            self._last_browser_activity = asyncio.get_running_loop().time()
+                    elif isinstance(block, ThinkingBlock):
+                        logger.debug("[SDK] thinking block")
+            elif isinstance(msg, UserMessage):
+                if msg.content:
+                    proxy_progress("🔧 tool 完成，繼續處理...")
+                    if isinstance(msg.content, list) and proxy_photo:
+                        for blk in msg.content:
+                            if isinstance(blk, ToolResultBlock) and isinstance(blk.content, list):
+                                for item in blk.content:
+                                    if isinstance(item, dict) and item.get("type") == "image":
+                                        src = item.get("source", {})
+                                        if src.get("type") == "base64":
+                                            try:
+                                                data = base64.b64decode(src.get("data", ""))
+                                                media_type = src.get("media_type", "image/png")
+                                                logger.info(f"[SDK] 偵測到截圖 {len(data)} bytes ({media_type})")
+                                                proxy_photo(data, media_type)
+                                                if screenshot_collector is not None:
+                                                    screenshot_collector.append((data, media_type))
+                                            except Exception as e:
+                                                logger.warning(f"圖片 decode 失敗: {e}")
+            elif isinstance(msg, ResultMessage):
+                if msg.session_id and msg.session_id != self.current_session_id:
+                    self.current_session_id = msg.session_id
+                    save_session_id(msg.session_id)
+                    logger.info(f"[SDK] session_id 更新: {msg.session_id[:12]}...")
+                if msg.is_error:
+                    err = msg.result or "(unknown error)"
+                    logger.error(f"[SDK] ResultMessage error: {err}")
+                    text_chunks.append(f"\n\n[Claude 回報錯誤: {err}]")
+                if msg.total_cost_usd is not None:
+                    logger.info(f"[SDK] 成本 USD={msg.total_cost_usd:.4f}, turns={msg.num_turns}, dur={msg.duration_ms}ms")
+
+    async def _interrupt_and_drain(self) -> None:
+        if not self.sdk_client:
+            return
+        try:
+            await self.sdk_client.interrupt()
+        except Exception as e:
+            logger.warning(f"interrupt 失敗: {e}")
+        try:
+            await asyncio.wait_for(self._drain_response_inner(), timeout=10)
+        except asyncio.TimeoutError:
+            logger.warning("interrupt 後 drain 也超時，client 可能需要重連")
+
+    async def _drain_response_inner(self) -> None:
+        if not self.sdk_client:
+            return
+        async for msg in self.sdk_client.receive_response():
+            if isinstance(msg, ResultMessage):
+                if msg.session_id and msg.session_id != self.current_session_id:
+                    self.current_session_id = msg.session_id
+                    save_session_id(msg.session_id)
+                logger.info(f"[SDK] drain 完成 (subtype={msg.subtype})")
+                break
+
+    @staticmethod
+    def _summarize_tool_use(block) -> str:
+        name = block.name
+        inp = block.input or {}
+        if name == "Bash":
+            cmd = (inp.get("command") or "")[:80]
+            return f"Bash: {cmd}"
+        if name in ("Read", "Edit", "Write"):
+            path = inp.get("file_path") or inp.get("path") or ""
+            return f"{name}: {path}"
+        if name == "Glob":
+            return f"Glob: {inp.get('pattern','')}"
+        if name == "Grep":
+            return f"Grep: {inp.get('pattern','')}"
+        if name == "WebFetch":
+            return f"WebFetch: {inp.get('url','')}"
+        if name == "WebSearch":
+            return f"WebSearch: {inp.get('query','')}"
+        if name == "Task":
+            return f"Task(subagent): {inp.get('description','')}"
+        if name.startswith("mcp__"):
+            return f"MCP {name}"
+        return f"Tool: {name}"
+
+    def _format_output(self, output: str) -> str:
+        ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+        output = ansi_escape.sub('', output)
+        if len(output) > 8000:
+            output = output[:8000] + "\n\n...(輸出已截斷)"
+        return output
+
+    # --- 主訊息流程 ---
+
+    async def handle_message(
+        self,
+        chat_id: int,
+        text: str,
+        progress_cb: Optional[callable] = None,
+        photo_cb: Optional[callable] = None,
+    ) -> Tuple[str, Optional[str]]:
+        text = text.strip()
+        cmd = text.split()[0].lower() if text else ""
+        if cmd in self.special_commands:
+            logger.info(f"收到指令 (chat_id={chat_id}): {cmd}")
+            return await self.special_commands[cmd](chat_id), None
+
+        # v3.1.6 P1+P2：佇列滿了在 URL 預處理「之前」就彈回（URL 不白抓、
+        # 彈回字串不落地）。佇列未滿則告知排隊後照常預處理 — 排隊的訊息
+        # 終究會執行，預處理與當前任務並行反而省等待時間。
+        if self._exec_lock.locked():
+            if self._queue_waiting >= CONFIG.get("QUEUE_MAX_WAITING", 2):
+                logger.info(f"佇列已滿彈回 (chat_id={chat_id}): {text[:60]}")
+                return BUSY_BOUNCE_MSG, None
+            position = self._queue_waiting + 1
+            logger.info(f"任務排隊 (chat_id={chat_id}, 第 {position} 位): {text[:60]}")
+            if progress_cb:
+                try:
+                    await progress_cb(f"⏳ Claude 忙碌中，已排隊（前方共 {position} 個任務）...")
+                except Exception:
+                    pass
+
+        logger.info(f"收到訊息 (chat_id={chat_id}): {text[:100]}...")
+        self.metrics.record_message()
+
+        # === URL 預處理 ===
+        enhanced_text, url_summaries, obsidian_queue = await preprocess_urls(
+            text, config=CONFIG, metrics=self.metrics
+        )
+
+        url_status = None
+        if url_summaries:
+            url_status = "🔗 URL 處理結果:\n" + "\n".join(url_summaries)
+            logger.info(f"URL 預處理完成: {url_summaries}")
+
+        # === 回覆抓取 ===
+        reply_triggered, user_criteria = detect_reply_keywords(
+            text, CONFIG.get("REPLY_KEYWORDS", [])
+        )
+        replies_section = ""
+        replies_prompt_block = ""
+
+        if reply_triggered and TWIKIT_AVAILABLE:
+            detected = detect_urls(text)
+            twitter_urls = [(u, p) for u, p in detected if p == "x_twitter"]
+            if twitter_urls:
+                tweet_url = twitter_urls[0][0]
+                tweet_id = extract_tweet_id(tweet_url)
+                if tweet_id:
+                    logger.info(f"[reply] 觸發回覆抓取: tweet={tweet_id}, 條件='{user_criteria}'")
+                    raw_replies, reply_err = await fetch_tweet_replies(
+                        tweet_id,
+                        str(CONFIG["TWIKIT_COOKIES"]),
+                        max_count=CONFIG.get("REPLY_MAX_FETCH", 80),
+                    )
+                    if reply_err is None and raw_replies:
+                        self.metrics.record_reply_fetch(success=True)
+                        filtered = await filter_replies_with_ai(
+                            raw_replies, user_criteria, CONFIG
+                        )
+                        replies_section = format_replies_for_obsidian(filtered)
+                        replies_prompt_block = format_replies_for_prompt(filtered)
+                        note = f"💬 回覆: 抓取 {len(raw_replies)} → 篩選 {len(filtered)} 則"
+                        url_status = (url_status + "\n" + note) if url_status else note
+                    elif reply_err is None and not raw_replies:
+                        self.metrics.record_reply_fetch(success=True)
+                        note = "💬 回覆: 此推文暫無回覆"
+                        url_status = (url_status + "\n" + note) if url_status else note
+                    else:
+                        self.metrics.record_reply_fetch(success=False, error_code=reply_err)
+                        err_msg_map = {
+                            "cookies_invalid": "cookies 過期，請重跑 extract_cookies.bat",
+                            "cookies_missing": "cookies.json 不存在",
+                            "tweet_not_found": "找不到此推文（可能已刪除或受保護）",
+                            "network_timeout": "網路逾時（已重試）",
+                            "network_conn": "網路連線失敗（已重試）",
+                            "twikit_api": "twikit API 異常（可能需要更新 twikit 或 patch transaction.py）",
+                            "twikit_unavailable": "twikit 未安裝",
+                        }
+                        msg_detail = err_msg_map.get(reply_err, f"錯誤: {reply_err}")
+                        replies_prompt_block = _build_playwright_reply_fallback(
+                            tweet_url, user_criteria, msg_detail
+                        )
+                        note = f"💬 twikit 失敗（{msg_detail}），改由 Playwright fallback 抓取"
+                        url_status = (url_status + "\n" + note) if url_status else note
+        elif reply_triggered and not TWIKIT_AVAILABLE:
+            detected = detect_urls(text)
+            twitter_urls = [(u, p) for u, p in detected if p == "x_twitter"]
+            if twitter_urls:
+                replies_prompt_block = _build_playwright_reply_fallback(
+                    twitter_urls[0][0], user_criteria, "twikit 未安裝"
+                )
+                note = "💬 twikit 不可用，改由 Playwright fallback 抓取"
+            else:
+                note = "💬 偵測到回覆抓取關鍵字但無 X/Twitter URL"
+            url_status = (url_status + "\n" + note) if url_status else note
+
+        if replies_prompt_block:
+            enhanced_text += replies_prompt_block
+
+        self.history.add_user_message(text)
+        screenshot_collector: List[Tuple[bytes, str]] = []
+        response = await self.execute_claude(
+            enhanced_text, progress_cb=progress_cb, photo_cb=photo_cb,
+            screenshot_collector=screenshot_collector,
+        )
+
+        # v3.1.6 P1：TOCTOU 兜底 — 內層彈回不是分析結果，不落地、不進歷史
+        if response == BUSY_BOUNCE_MSG:
+            return response, url_status
+
+        if url_summaries:
+            detected = detect_urls(text)
+            if detected:
+                fetch_url = detected[0][0]
+                user_note = text.replace(fetch_url, "").strip()
+                await asyncio.get_running_loop().run_in_executor(
+                    None, save_fetch_output, fetch_url, enhanced_text, response, user_note, CONFIG
+                )
+
+        if obsidian_queue:
+            for ob_url, ob_content, ob_meta in obsidian_queue:
+                saved_path = await asyncio.get_running_loop().run_in_executor(
+                    None, save_to_obsidian, ob_url, ob_content, response,
+                    ob_meta, CONFIG, replies_section, screenshot_collector,
+                )
+                if saved_path:
+                    self.metrics.record_obsidian_save()
+
+        self.history.add_assistant_message(response)
+        self.history.save(CONFIG["HISTORY_FILE"])
+
+        return response, url_status
+
+
+# === Module-level singleton ===
+
+bridge: Optional[ClaudeBridge] = None
+
+def init_bridge() -> ClaudeBridge:
+    global bridge
+    bridge = ClaudeBridge()
+    return bridge

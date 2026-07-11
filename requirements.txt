@@ -1,8 +1,29 @@
 # Telegram Claude Bridge public runtime dependencies
+#
+# Pinned versions reflect the local build that ships this code; loosen if you
+# hit conflicts. Notes:
+#   - twikit's transaction.py occasionally needs a manual patch when X changes
+#     its frontend JS. Optional — Playwright fallback handles X reply capture
+#     when twikit is missing or broken.
+#   - claude-agent-sdk requires the local `claude` CLI to be installed.
+
 python-telegram-bot==22.6
 requests==2.32.5
 yt-dlp>=2025.1.0
-google-generativeai==0.8.6
-langextract>=1.0.0
+google-genai>=1.0.0
 claude-agent-sdk>=0.1.68
 trafilatura>=2.0.0
+
+# Optional — X/Twitter reply capture. Skip if you don't need /reply features.
+twikit==2.3.3
+
+# Optional — orphan child cleanup on /clear (Windows TerminateProcess does not
+# kill descendants by default). Without this the SDK still cleans up on exit.
+psutil>=5.9.0
+
+# Optional — structured extraction for general article URLs.
+langextract>=1.0.0
+
+# Optional — PDF text extraction (arxiv links, *.pdf URLs). Without it the
+# bridge falls back to a Playwright prompt for PDF pages.
+pymupdf>=1.24.0

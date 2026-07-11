@@ -79,6 +79,16 @@ except ImportError:
     TRAFILATURA_AVAILABLE = False
     logger.info("trafilatura 未安裝，general URL 將只能拿到 title/og:description")
 
+# Fix#1 (2026-06-13)：PDF 抽取。arxiv.org/pdf 與一般 .pdf 之前被當 HTML 丟給
+# trafilatura，只會吐回 %PDF 原始位元組。改用 PyMuPDF(fitz) 正規解析。
+try:
+    import fitz  # PyMuPDF
+    PYMUPDF_AVAILABLE = True
+    logger.info(f"PyMuPDF {fitz.__doc__.splitlines()[0] if fitz.__doc__ else ''} 可用，啟用 PDF 抽取路徑")
+except ImportError:
+    PYMUPDF_AVAILABLE = False
+    logger.info("PyMuPDF 未安裝，PDF 連結將無法抽取正文")
+
 # vision 模組 — 延遲 import 避免循環依賴
 from vision import analyze_images, GENAI_AVAILABLE
 
@@ -104,6 +114,26 @@ PLATFORM_PATTERNS = {
 }
 
 
+# v3.1.6 P1：中文輸入「URL，說明」不加空格是常態，\S+ 會把全形標點與後續文字
+# 吞進 URL → fetch 404 → 白白降級 Playwright fallback。
+# 截斷規則：從第一個「全形標點」起砍掉尾巴（CJK 符號區 3000-303F、全形 ASCII 變體
+# FF00-FF65、省略號/彎引號）。刻意不截漢字本身 — 原生中文路徑
+# （如 zh.wikipedia.org/wiki/台灣）是合法 URL，requests 會自行編碼。
+_FW_PUNCT_TAIL = re.compile(r"[　-〿＀-･…‘’“”].*$", re.DOTALL)
+
+
+def _clean_url(url: str) -> str:
+    url = _FW_PUNCT_TAIL.sub("", url)
+    # ASCII 結尾標點剝除（「看 URL.」「URL,」等）；逐字元處理保留路徑內的同字元
+    while url and url[-1] in ".,;:!?'\"":
+        url = url[:-1]
+    # 括號平衡：尾端多出的 ) 通常是「(見 URL)」的外括號；
+    # 但 wikipedia 的 /Foo_(bar) 內有成對 ( 則保留
+    while url.endswith(")") and url.count("(") < url.count(")"):
+        url = url[:-1]
+    return url
+
+
 def detect_urls(text: str) -> List[Tuple[str, str]]:
     """
     從訊息中偵測 URL 並分類平台。
@@ -116,14 +146,18 @@ def detect_urls(text: str) -> List[Tuple[str, str]]:
     for platform in ["x_twitter", "youtube", "github"]:
         for pattern in PLATFORM_PATTERNS[platform]:
             for match in re.finditer(pattern, text):
-                url = match.group(0)
+                url = _clean_url(match.group(0))
+                if len(url) < 10 or url.endswith("://"):
+                    continue
                 if url not in found_urls:
                     found_urls.add(url)
                     found.append((url, platform))
 
     for pattern in PLATFORM_PATTERNS["general"]:
         for match in re.finditer(pattern, text):
-            url = match.group(0)
+            url = _clean_url(match.group(0))
+            if len(url) < 10 or url.endswith("://"):
+                continue
             if url not in found_urls:
                 found_urls.add(url)
                 found.append((url, "general"))
@@ -493,6 +527,91 @@ def fetch_via_github_api(url: str, config: dict = None):
 
 # --- v3.1 P0: trafilatura 正文抽取（general URL 主路徑） ---
 
+# --- PDF 抽取（arxiv / 一般 .pdf）---
+
+def _looks_like_pdf(url: str) -> bool:
+    """URL 啟發式：是否可能指向 PDF。實際內容由 fetch_via_pdf 再以 magic bytes 確認。"""
+    u = url.lower().split("?")[0].split("#")[0]
+    if u.endswith(".pdf"):
+        return True
+    if "arxiv.org/pdf/" in u:
+        return True
+    return False
+
+
+def _pdf_date_to_iso(raw: str) -> str:
+    """PyMuPDF metadata 日期 'D:20260529120000Z' → '2026-05-29'；無法解析回空字串。"""
+    if not raw:
+        return ""
+    m = re.search(r"(\d{4})(\d{2})(\d{2})", raw)
+    return f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else ""
+
+
+def fetch_via_pdf(url: str, config: dict = None) -> Optional[str]:
+    """
+    下載 PDF bytes 並用 PyMuPDF 抽純文字。專治 arxiv.org/pdf 與一般 .pdf —
+    trafilatura 對這類連結只會吐回 %PDF 原始位元組（Fix#1, 2026-06-13）。
+    非 PDF 內容（magic bytes 不符）回 None，交回 trafilatura 一般路徑。
+    """
+    if not (REQUESTS_AVAILABLE and PYMUPDF_AVAILABLE):
+        return None
+    cfg = config or {}
+    fetch_timeout = cfg.get("URL_FETCH_TIMEOUT", 15)
+    max_pages = cfg.get("PDF_MAX_PAGES", 40)
+    try:
+        logger.info(f"[pdf] 嘗試抓取: {url}")
+        resp = requests.get(url, timeout=fetch_timeout, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }, allow_redirects=True)
+        if resp.status_code != 200:
+            return None
+        raw = resp.content
+        ctype = resp.headers.get("Content-Type", "").lower()
+        if not (raw[:5] == b"%PDF-" or "application/pdf" in ctype):
+            logger.info(f"[pdf] 非 PDF 內容（ctype={ctype}），交回一般路徑")
+            return None
+
+        doc = fitz.open(stream=raw, filetype="pdf")
+        try:
+            page_count = doc.page_count
+            pages = []
+            for i, page in enumerate(doc):
+                if i >= max_pages:
+                    break
+                pages.append(page.get_text())
+            meta = doc.metadata or {}
+        finally:
+            doc.close()
+
+        body = re.sub(r"\n{3,}", "\n\n", "\n".join(pages)).strip()
+        if len(body) < 100:
+            logger.info(f"[pdf] 抽到的文字過短（{len(body)} chars），可能是掃描影像 PDF，視為失敗")
+            return None
+
+        title = (meta.get("title") or "").strip()
+        author = (meta.get("author") or "").strip()
+        date_iso = _pdf_date_to_iso(meta.get("creationDate") or meta.get("modDate") or "")
+
+        parts = [f"🔗 來源: {url}"]
+        if title:
+            parts.append(f"📌 標題: {title}")
+        if author:
+            parts.append(f"👤 作者: {author}")
+        if date_iso:
+            parts.append(f"📅 發布日期: {date_iso}")
+        parts.append(f"📄 頁數: {page_count}（已抽 {min(page_count, max_pages)} 頁）")
+        parts.append("")
+        if len(body) > 12000:
+            body = body[:12000] + "\n\n…(內容過長已截斷)"
+        parts.append(body)
+        result = "\n".join(parts)
+        logger.info(f"[pdf] 成功抽取 {page_count} 頁，{len(result)} 字元")
+        return result
+    except Exception as e:
+        logger.warning(f"[pdf] 失敗，將 fallback 到 trafilatura/http: {e}")
+        return None
+
+
 def fetch_via_trafilatura(url: str, config: dict = None) -> Optional[str]:
     """
     用 trafilatura 抽正文。對新聞站、Perplexity、Substack、各類 article 頁面
@@ -511,6 +630,12 @@ def fetch_via_trafilatura(url: str, config: dict = None) -> Optional[str]:
             }, allow_redirects=True)
             if resp.status_code != 200:
                 return None
+            # 防護：若回應其實是 PDF（啟發式漏掉、或重導向到 PDF），不要把原始位元組
+            # 當 HTML 抽取（會吐回 %PDF...）。改走 PDF 路徑或直接視為失敗。
+            ctype = resp.headers.get("Content-Type", "").lower()
+            if resp.content[:5] == b"%PDF-" or "application/pdf" in ctype:
+                logger.info("[trafilatura] 偵測到 PDF 內容，改用 fetch_via_pdf")
+                return fetch_via_pdf(url, config)
             html = resp.text
         else:
             html = trafilatura.fetch_url(url)
@@ -610,6 +735,50 @@ def fetch_via_http(url: str, config: dict = None) -> Optional[str]:
 
 # --- LangExtract ---
 
+# Fix#3 (2026-06-13)：langextract 新版 API = 位置參數 text_or_documents +
+# prompt_description + examples(few-shot) + model_id。舊碼的 text=/prompt=/model=
+# 已被拒收（→ 每個 general URL 的結構化抽取靜默失敗、軟降級回原文）。
+# 另：fetch_urls 預設 True 會去抓內文裡的 URL（網路地雷），一律關閉；
+# show_progress 預設 True 會把進度條噴進 log，一併關閉。
+_LX_MODEL = "gemini-2.5-flash"
+
+
+def _lx_example():
+    """共用 few-shot：示範要抽的類別（組織/人/產品/日期/數據/宣稱）。"""
+    return lx.data.ExampleData(
+        text="OpenAI released GPT-5 on 2025-03-01, reaching 100M users; CEO Sam Altman called it a milestone.",
+        extractions=[
+            lx.data.Extraction(extraction_class="organization", extraction_text="OpenAI"),
+            lx.data.Extraction(extraction_class="product", extraction_text="GPT-5"),
+            lx.data.Extraction(extraction_class="date", extraction_text="2025-03-01"),
+            lx.data.Extraction(extraction_class="metric", extraction_text="100M users"),
+            lx.data.Extraction(extraction_class="person", extraction_text="Sam Altman"),
+            lx.data.Extraction(extraction_class="claim", extraction_text="called it a milestone"),
+        ],
+    )
+
+
+def _lx_run(text, prompt_description):
+    """以新版 langextract API 抽取，回傳格式化條列字串（無結果回 None）。"""
+    res = lx.extract(
+        text,
+        prompt_description=prompt_description,
+        examples=[_lx_example()],
+        model_id=_LX_MODEL,
+        api_key=os.getenv("GOOGLE_API_KEY"),
+        fetch_urls=False,
+        show_progress=False,
+    )
+    exts = getattr(res, "extractions", None) or []
+    lines = []
+    for e in exts:
+        cls = (getattr(e, "extraction_class", "") or "").strip()
+        txt = (getattr(e, "extraction_text", "") or "").strip()
+        if txt:
+            lines.append(f"- {cls}: {txt}" if cls else f"- {txt}")
+    return "\n".join(lines) if lines else None
+
+
 def enhance_with_langextract(raw_content, url):
     """Use LangExtract to extract structured info from fetched web content."""
     if not LANGEXTRACT_AVAILABLE or len(raw_content) < 200:
@@ -618,15 +787,12 @@ def enhance_with_langextract(raw_content, url):
         if not os.getenv('GOOGLE_API_KEY'):
             return None
         logger.info(f'[langextract] extracting ({len(raw_content)} chars)...')
-        extract_results = lx.extract(
-            text=raw_content[:5000],
-            prompt='Extract key information: main topic, key claims/data, people/orgs, numbers/stats, conclusion.',
-            model='gemini-2.0-flash'
+        result_text = _lx_run(
+            raw_content[:5000],
+            'Extract key information: organizations, people, products, dates, '
+            'numeric metrics/stats, and the main claims/conclusions.',
         )
-        if not extract_results:
-            return None
-        result_text = str(extract_results)
-        if len(result_text) < 50:
+        if not result_text or len(result_text) < 50:
             return None
         sep = chr(10) + chr(10)
         return raw_content + sep + '=== LangExtract ===' + chr(10) + result_text[:2000] + chr(10) + '=== end ==='
@@ -643,9 +809,9 @@ def extract_structured_data(text, prompt=None):
         return 'GOOGLE_API_KEY not set'
     try:
         dp = 'Extract all key entities, facts, numbers, relationships. Organize in structured format.'
-        res = lx.extract(text=text[:8000], prompt=prompt or dp, model='gemini-2.0-flash')
-        if res:
-            return 'LangExtract result:' + chr(10) + chr(10) + str(res)[:3000]
+        result_text = _lx_run(text[:8000], prompt or dp)
+        if result_text:
+            return 'LangExtract result:' + chr(10) + chr(10) + result_text[:3000]
         return 'Extraction complete but no results'
     except Exception as e:
         return f'Extraction failed: {e}'
@@ -690,7 +856,7 @@ def save_to_obsidian(url: str, fetched_content: str, claude_response: str,
     截圖寫到 vault 的 attachments 子目錄並用 markdown image 語法嵌入筆記。
     """
     cfg = config or {}
-    obsidian_dir = Path(cfg.get("OBSIDIAN_MOBILE_DIR", Path("obsidian_clippings")))
+    obsidian_dir = Path(cfg.get("OBSIDIAN_MOBILE_DIR", Path(__file__).resolve().parent / "obsidian_clippings"))
 
     try:
         obsidian_dir.mkdir(parents=True, exist_ok=True)
@@ -805,7 +971,7 @@ def save_to_obsidian(url: str, fetched_content: str, claude_response: str,
 def save_fetch_output(url, fetched_content, claude_response, user_note="", config: dict = None):
     """Save AI-friendly markdown summary to fetch_outputs/."""
     cfg = config or {}
-    output_dir = cfg.get("FETCH_OUTPUT_DIR", Path("fetch_outputs"))
+    output_dir = cfg.get("FETCH_OUTPUT_DIR", Path(__file__).resolve().parent / "fetch_outputs")
 
     try:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -845,7 +1011,7 @@ def save_fetch_output(url, fetched_content, claude_response, user_note="", confi
 # --- URL 預處理編排器 ---
 
 async def preprocess_urls(text: str, config: dict = None,
-                         metrics=None) -> Tuple[str, List[str], list]:
+                         metrics=None) -> Tuple[str, List[str]]:
     """
     偵測訊息中的 URL，自動抓取內容，回傳增強後的訊息。
 
@@ -931,6 +1097,19 @@ async def preprocess_urls(text: str, config: dict = None,
                     method_used += f"(retry:{attempts})"
                 obsidian_queue.append((url, content, gh_meta))
 
+        # Fix#1 (2026-06-13)：PDF 主路徑（arxiv.org/pdf、一般 .pdf）。必須跑在
+        # trafilatura 之前，否則 PDF 會被當 HTML 抽成 %PDF 原始位元組餵給 Claude。
+        if not content and PYMUPDF_AVAILABLE and _looks_like_pdf(url):
+            result, attempts, pdf_elapsed = await asyncio.get_event_loop().run_in_executor(
+                None, retry_fetch, fetch_via_pdf, url, cfg,
+            )
+            fetch_elapsed += pdf_elapsed
+            if result is not None:
+                content = result
+                method_used = "pdf"
+                if attempts > 1:
+                    method_used += f"(retry:{attempts})"
+
         # v3.1 P0：trafilatura 主路徑（general / 任何尚未抓到內容的 URL）
         # 對新聞站、Perplexity、Substack 等 article 頁面，比 fetch_via_http 厚很多
         if not content and TRAFILATURA_AVAILABLE:
@@ -958,7 +1137,10 @@ async def preprocess_urls(text: str, config: dict = None,
 
         if content:
             # LangExtract enhancement for general URLs（trafilatura 後也可再跑，正文乾淨度更好）
-            if platform == "general" and LANGEXTRACT_AVAILABLE and len(content) > 300:
+            # Fix#3 (2026-06-13)：預設關閉 — 對 Claude 下游而言這層 entity 抽取多半冗餘，
+            # 且每個 general URL 會多一次 ~2-4s Gemini 呼叫。需要時設 LANGEXTRACT_AUTO_ENHANCE=True。
+            if (platform == "general" and LANGEXTRACT_AVAILABLE
+                    and cfg.get("LANGEXTRACT_AUTO_ENHANCE", False) and len(content) > 300):
                 enhanced = await asyncio.get_event_loop().run_in_executor(None, enhance_with_langextract, content, url)
                 if enhanced:
                     content = enhanced

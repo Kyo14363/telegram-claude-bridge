@@ -1,0 +1,5 @@
+# Windows launcher/automation scripts must check out with CRLF endings
+# regardless of the cloning machine's core.autocrlf setting.
+*.bat text eol=crlf
+*.vbs text eol=crlf
+*.ps1 text eol=crlf
