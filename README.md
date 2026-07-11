@@ -17,6 +17,14 @@ asyncio event-loop policy and console encoding break things in non-obvious
 ways. This repo is that reference: a small production deployment with the
 scars documented in its [CHANGELOG](CHANGELOG.md).
 
+![Two real conversations with the bridge](docs/demo.png)
+
+*Two real sessions. Left: an X link sent from the phone — the resident SDK
+session searches the local Obsidian vault and reports duplicates and
+near-overlaps before filing. Right: a Perplexity page the static fetcher
+can't reach — the bridge flags it, Claude drives Playwright instead, and
+progress streams back to Telegram.*
+
 ## What It Does
 
 - Persistent Claude Code session through `claude-agent-sdk` (one session
