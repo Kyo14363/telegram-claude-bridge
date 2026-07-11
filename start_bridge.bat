@@ -1,6 +1,6 @@
 @echo off
 setlocal
-title Telegram Claude Bridge v3.1 (Persistent SDK)
+title Telegram Claude Bridge v3.3 (Persistent SDK)
 
 cd /d "%~dp0" || goto :end
 
@@ -12,7 +12,7 @@ if exist ".env" (
 )
 
 echo ========================================
-echo   Telegram Claude Bridge v3.1
+echo   Telegram Claude Bridge v3.3
 echo   Persistent Claude Agent SDK
 echo ========================================
 echo.

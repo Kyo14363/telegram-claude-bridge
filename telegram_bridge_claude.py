@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram <-> Claude Code Bridge v3.1 — Entry Point
+Telegram <-> Claude Code Bridge v3.3 — Entry Point
 ====================================================
 Public modular layout (Phase 1 module split):
   config.py       — env-driven CONFIG, system_prompt fragments, log redaction
@@ -30,7 +30,8 @@ try:
     from telegram import Update
     from telegram.ext import Application, CommandHandler, MessageHandler, filters
     from handlers import (
-        start_command, exec_command, message_handler, photo_handler,
+        start_command, exec_command, resume_command, handoff_command,
+        message_handler, photo_handler,
         unsupported_handler, error_handler,
     )
     from shortcuts import (
@@ -108,6 +109,8 @@ def main():
     )
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("exec", exec_command))
+    application.add_handler(CommandHandler("resume", resume_command))
+    application.add_handler(CommandHandler("handoff", handoff_command))
     application.add_handler(CommandHandler("ps", ps_command))
     application.add_handler(CommandHandler("cclog", cclog_command))
     application.add_handler(CommandHandler("tasklog", tasklog_command))
@@ -122,6 +125,7 @@ def main():
     cli_path = CONFIG.get("CLAUDE_CLI_PATH")
     cli_exists = Path(cli_path).exists() if cli_path else "N/A"
     logger.info(f"Claude CLI：{cli_path} (exists={cli_exists})")
+    logger.info(f"模型（已釘選，免疫全域 settings 漂移）：{CONFIG['SDK_MODEL']}")
     logger.info(f"Permission mode：{CONFIG['SDK_PERMISSION_MODE']}")
     logger.info(f"Setting sources：{CONFIG['SDK_SETTING_SOURCES']}")
     logger.info(f"Skills：{CONFIG['SDK_SKILLS']}")

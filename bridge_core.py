@@ -27,10 +27,10 @@ try:
 except ImportError:
     PSUTIL_AVAILABLE = False
 
-# v3.1.2 Phase 1.5：CONFIG / 路徑 / Token redact filter / system_prompt 片段已抽至 config.py
+# v3.1.2 Phase 1.5：CONFIG / 路徑 / Token redact / system_prompt 片段已抽至 config.py
 from config import (
     CONFIG, VERSION, VERSION_LABEL,
-    _TokenRedactFilter, SYSTEM_PROMPT_APPEND,
+    _TokenRedactingFormatter, SYSTEM_PROMPT_APPEND,
 )
 
 
@@ -40,18 +40,29 @@ def setup_logging():
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
 
+    # v3.1.6：token 遮罩改掛 handler-level formatter（見 config.py 註解）
+    formatter = _TokenRedactingFormatter('%(asctime)s - %(levelname)s - %(message)s')
+
     file_handler = TimedRotatingFileHandler(
         log_file, when='midnight', interval=1,
         backupCount=CONFIG["LOG_RETENTION_DAYS"], encoding='utf-8'
     )
     file_handler.suffix = "%Y-%m-%d.log"
-    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    # v3.1.6：自訂 suffix 加了 ".log" 但 stdlib extMatch 只認 "%Y-%m-%d"，
+    # getFilesToDelete() 的 fullmatch 永遠失敗 → backupCount 從未刪檔
+    # （2026-06-10 實測：128 個 log 檔回溯 4 個月）。extMatch 必須與 suffix 同步。
+    file_handler.extMatch = re.compile(r"^\d{4}-\d{2}-\d{2}\.log$", re.ASCII)
+    file_handler.setFormatter(formatter)
 
     console_handler = logging.StreamHandler()
-    console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    console_handler.setFormatter(formatter)
 
     root_logger.addHandler(file_handler)
     root_logger.addHandler(console_handler)
+
+    # v3.1.6：httpx 每 10s 一行 getUpdates INFO（含完整 bot URL）＝主要洩漏源 + 噪音
+    # （~8,600 行/日）。降到 WARNING：錯誤仍可見，常態 polling 不進 log。
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     return logging.getLogger(__name__)
 
 def cleanup_old_logs():
@@ -59,9 +70,14 @@ def cleanup_old_logs():
     log_pattern = CONFIG["LOG_DIR"] / "bridge.log.*"
     deleted_count = 0
     for log_file in glob.glob(str(log_pattern)):
+        # v3.1.6：舊解析 split('.')[-1] 對 "bridge.log.2026-02-02.log" 取到 "log"
+        # 而非日期 → strptime 必拋 ValueError → 從未刪過任何檔。改用 regex 直取日期，
+        # 同時相容有/無 ".log" 結尾兩種命名。
+        m = re.search(r"bridge\.log\.(\d{4}-\d{2}-\d{2})(?:\.log)?$", log_file)
+        if not m:
+            continue
         try:
-            date_str = log_file.split('.')[-1].replace('.log', '')
-            file_date = datetime.strptime(date_str, "%Y-%m-%d")
+            file_date = datetime.strptime(m.group(1), "%Y-%m-%d")
             if file_date < cutoff_date:
                 os.remove(log_file)
                 deleted_count += 1
@@ -71,7 +87,6 @@ def cleanup_old_logs():
         logging.info(f"已清理 {deleted_count} 個超過 {CONFIG['LOG_RETENTION_DAYS']} 天的舊 log 檔案")
 
 logger = setup_logging()
-logging.getLogger().addFilter(_TokenRedactFilter())
 
 # === 外部模組 ===
 try:
@@ -177,6 +192,18 @@ twikit 錯誤：{twikit_err}
 """
 
 
+# v3.1.6 P2：Playwright 瀏覽器進程名（psutil 直接關閉用）。
+# 只在 SDK claude.exe 子樹內比對 — 使用者自己的桌面 Chrome 不在樹內，不會誤殺。
+_BROWSER_PROC_NAMES = ("chrome.exe", "chromium.exe", "msedge.exe", "headless_shell.exe", "firefox.exe")
+
+
+# v3.1.6 P1+P2：彈回訊息統一為常數。P2 起忙碌訊息改走 FIFO 佇列
+# （asyncio.Lock 的 waiter 順序即佇列），只有佇列滿了才彈回。
+# handle_message 靠比對此字串跳過 save_fetch_output / save_to_obsidian / 歷史寫入 —
+# 沒有這層兜底，彈回字串會被當成「Claude 初步分析」寫進 Obsidian。
+BUSY_BOUNCE_MSG = "Claude 任務佇列已滿，請稍後再試（或用 /interrupt 中斷當前任務）..."
+
+
 # === Session 狀態持久化 ===
 
 def load_session_id() -> Optional[str]:
@@ -223,6 +250,8 @@ class ClaudeBridge:
         self.history = ConversationHistory.load(CONFIG["HISTORY_FILE"], CONFIG["MAX_HISTORY_ROUNDS"])
         self.is_busy = False
         self._exec_lock = asyncio.Lock()
+        # v3.1.6 P2：排隊中（等鎖、未執行）的任務數。只在主 loop 上增減，無 race。
+        self._queue_waiting = 0
         self.metrics = Metrics(CONFIG["BASE_DIR"] / "stats.json")
         self.sdk_client: Optional[ClaudeSDKClient] = None
         self.current_session_id: Optional[str] = load_session_id()
@@ -231,13 +260,16 @@ class ClaudeBridge:
         self._main_loop: Optional[asyncio.AbstractEventLoop] = None
         self._last_browser_activity: float = 0.0
         self._idle_watchdog_task: Optional[asyncio.Task] = None
+        # v3.2.3：活性心跳 task（主 loop 上；卡死偵測的訊號源）
+        self._heartbeat_task: Optional[asyncio.Task] = None
+        # v3.2.2：移除 /session（與 /status 重疊 80%，session 完整資訊已併入）
+        # 與 /history（v3.0 起 context 由 SDK 自管；ConversationHistory 類別保留
+        # 供 photo handler 的 Gemini context fallback 使用，僅指令出口移除）
         self.special_commands = {
             "/clear": self._cmd_clear,
-            "/history": self._cmd_show_history,
             "/help": self._cmd_help,
             "/status": self._cmd_status,
             "/stats": self._cmd_stats,
-            "/session": self._cmd_session,
             "/interrupt": self._cmd_interrupt,
             "/browser-close": self._cmd_browser_close,
             "/keyboard": self._cmd_keyboard,
@@ -263,6 +295,7 @@ class ClaudeBridge:
 
         return ClaudeAgentOptions(
             cwd=str(CONFIG["WORKING_DIR"]),
+            model=CONFIG["SDK_MODEL"],
             permission_mode=CONFIG["SDK_PERMISSION_MODE"],
             setting_sources=CONFIG["SDK_SETTING_SOURCES"],
             skills=CONFIG["SDK_SKILLS"],
@@ -271,7 +304,8 @@ class ClaudeBridge:
                 "type": "preset",
                 "preset": "claude_code",
                 # 結構化片段組裝於 config.py：
-                # Browser autoclose + Provenance protocol + Telegram output style (v3.1.2 P2)
+                # Browser autoclose + Provenance protocol + Editorial triage (v3.3.3)
+                # + Telegram output style (v3.1.2 P2)
                 "append": SYSTEM_PROMPT_APPEND,
             },
             include_partial_messages=False,
@@ -318,6 +352,10 @@ class ClaudeBridge:
         if not SDK_AVAILABLE:
             raise RuntimeError("claude-agent-sdk 未安裝。請執行 pip install claude-agent-sdk")
         self._main_loop = asyncio.get_running_loop()
+        # v3.2.3：心跳先於 SDK 連線啟動 — SDK 失敗時 bridge 以受限模式續跑，
+        # 活性訊號（heartbeat.txt + 每小時 [hb] log）仍必須存在
+        if self._heartbeat_task is None or self._heartbeat_task.done():
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         self._ensure_sdk_thread()
         await self._submit_to_sdk(self._sdk_connect_impl(self.current_session_id))
         if self._idle_watchdog_task is None or self._idle_watchdog_task.done():
@@ -350,33 +388,63 @@ class ClaudeBridge:
                 raise
 
     async def stop_sdk(self) -> None:
+        if self._heartbeat_task and not self._heartbeat_task.done():
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if self._idle_watchdog_task and not self._idle_watchdog_task.done():
             self._idle_watchdog_task.cancel()
             try:
                 await self._idle_watchdog_task
             except (asyncio.CancelledError, Exception):
                 pass
+        # v3.1.5：先抓 PID，disconnect 後若仍有 claude.exe 子樹用 psutil 收乾淨
+        old_pid = self._capture_sdk_subprocess_pid()
         if self.sdk_client and self._sdk_loop:
             try:
                 await self._submit_to_sdk(self._sdk_disconnect_impl())
                 logger.info("Claude SDK 已斷線")
             except Exception as e:
                 logger.warning(f"SDK 斷線時錯誤: {e}")
+        if old_pid is not None:
+            self._terminate_descendants(old_pid)
         if self._sdk_loop and self._sdk_loop.is_running():
             self._sdk_loop.call_soon_threadsafe(self._sdk_loop.stop)
 
     def _capture_sdk_subprocess_pid(self) -> Optional[int]:
         if not self.sdk_client:
             return None
+        # Primary：戳 SDK 私有屬性 _transport._process.pid
         try:
             transport = getattr(self.sdk_client, "_transport", None)
-            if transport is None:
-                return None
-            proc = getattr(transport, "_process", None)
-            if proc is None:
-                return None
-            return proc.pid
+            if transport is not None:
+                proc = getattr(transport, "_process", None)
+                if proc is not None:
+                    return proc.pid
         except Exception:
+            pass
+        # Fallback（v3.1.5）：psutil 找 bridge process 底下最年輕的 claude.exe
+        # 用途：未來 SDK 升級若改了 _transport._process 路徑，primary 會回 None，
+        # 此時靠 psutil 仍能定位當前 SDK 的 claude.exe 以便 _terminate_descendants
+        if not PSUTIL_AVAILABLE:
+            return None
+        try:
+            import psutil
+            me = psutil.Process(os.getpid())
+            candidates = [
+                c for c in me.children(recursive=False)
+                if "claude" in c.name().lower()
+            ]
+            if not candidates:
+                return None
+            candidates.sort(key=lambda c: c.create_time(), reverse=True)
+            pid = candidates[0].pid
+            logger.info(f"[capture_pid] SDK 內部探測失敗，psutil fallback 取得 claude.exe pid={pid}")
+            return pid
+        except Exception as e:
+            logger.debug(f"[capture_pid] psutil fallback 失敗: {e}")
             return None
 
     @staticmethod
@@ -416,6 +484,10 @@ class ClaudeBridge:
             self.sdk_client = None
 
     async def restart_sdk_with_new_session(self) -> None:
+        # v3.1.5：完整 teardown 舊 SDK loop/thread 後再建立全新的，避免
+        # 在同一個 ProactorEventLoop 上做 disconnect→connect 導致 anyio
+        # cancellation 與新 task group 互鎖、SDKLoop 卡 busy loop（曾觀測到
+        # python.exe 持續 108% 單核）。
         watchdog_was_running = (
             self._idle_watchdog_task is not None and not self._idle_watchdog_task.done()
         )
@@ -427,22 +499,51 @@ class ClaudeBridge:
                 pass
 
         old_pid = self._capture_sdk_subprocess_pid()
+        old_loop = self._sdk_loop
+        old_thread = self._sdk_thread
 
-        if self.sdk_client:
+        # 1. Best-effort graceful disconnect（短 timeout，卡住就放棄走強制 teardown）
+        if self.sdk_client and old_loop is not None:
             try:
-                await self._submit_to_sdk(self._sdk_disconnect_impl())
+                await asyncio.wait_for(
+                    self._submit_to_sdk(self._sdk_disconnect_impl()),
+                    timeout=2.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("[clear] 舊 SDK disconnect 逾時 2s（將強制 teardown）")
             except Exception as e:
-                logger.warning(f"舊 session disconnect 失敗（將忽略）: {e}")
+                logger.warning(f"[clear] 舊 SDK disconnect 失敗（將強制 teardown）: {type(e).__name__}: {e}")
 
+        # 2. 殺舊 claude.exe 子樹
         if old_pid is not None:
             self._terminate_descendants(old_pid)
 
+        # 3. 停舊 loop、等舊 thread 結束（join 逾時不阻擋；舊 thread 是 daemon）
+        if old_loop is not None and old_loop.is_running():
+            try:
+                old_loop.call_soon_threadsafe(old_loop.stop)
+            except Exception as e:
+                logger.warning(f"[clear] 舊 SDK loop stop 失敗（忽略）: {type(e).__name__}: {e}")
+        if old_thread is not None:
+            old_thread.join(timeout=3.0)
+            if old_thread.is_alive():
+                logger.warning(
+                    "[clear] 舊 SDK thread 未在 3s 內結束，以 daemon 方式遺棄；"
+                    "新 thread 獨立不受影響"
+                )
+
+        # 4. 重置 state — _ensure_sdk_thread() 必須看到 None 才會建新 thread
+        self._sdk_loop = None
+        self._sdk_thread = None
+        self.sdk_client = None
         self.current_session_id = None
         clear_session_state()
         self._last_browser_activity = 0.0
 
+        # 5. 全新 thread + 全新 ProactorEventLoop + 新 SDK session
+        self._ensure_sdk_thread()
         await self._submit_to_sdk(self._sdk_connect_impl(resume_id=None))
-        logger.info("Claude SDK 已啟動全新 session")
+        logger.info("Claude SDK 已啟動全新 session（thread+loop 已完整 teardown 重建）")
 
         if watchdog_was_running:
             self._idle_watchdog_task = asyncio.create_task(self._idle_watchdog_loop())
@@ -459,30 +560,6 @@ class ClaudeBridge:
             logger.error(f"重啟 SDK 失敗: {e}")
             return f"清空成功但 SDK 重啟失敗：{e}"
 
-    async def _cmd_show_history(self, chat_id: int) -> str:
-        if not self.history.messages:
-            return "目前沒有本地參考歷史（注意：v3.0 的 Claude 上下文由 SDK session 自管，本地歷史僅供 /fetch /extract 等指令參考）。"
-        lines = [f"本地參考歷史 ({len(self.history.messages)} 條):"]
-        for i, msg in enumerate(self.history.messages):
-            prefix = "User" if msg.role == "user" else "Claude"
-            preview = msg.content[:100] + "..." if len(msg.content) > 100 else msg.content
-            preview = preview.replace('\n', ' ')
-            lines.append(f"[{i+1}] {prefix}: {preview}")
-        return "\n".join(lines)
-
-    async def _cmd_session(self, chat_id: int) -> str:
-        sid = self.current_session_id or "(尚未產生，下次對話後會建立)"
-        connected = "✅ 已連線" if self.sdk_client else "❌ 未連線"
-        return (
-            f"Claude SDK Session 狀態\n"
-            f"連線：{connected}\n"
-            f"Session ID：{sid}\n"
-            f"Working dir：{CONFIG['WORKING_DIR']}\n"
-            f"Permission mode：{CONFIG['SDK_PERMISSION_MODE']}\n"
-            f"Skills：{CONFIG['SDK_SKILLS']}\n"
-            f"Setting sources：{', '.join(CONFIG['SDK_SETTING_SOURCES'])}"
-        )
-
     async def _cmd_interrupt(self, chat_id: int) -> str:
         if not self.sdk_client:
             return "SDK 未連線。"
@@ -496,7 +573,56 @@ class ClaudeBridge:
         if self.sdk_client:
             await self.sdk_client.interrupt()
 
+    def _close_browser_processes(self) -> int:
+        """v3.1.6 P2：psutil 直接終結 SDK claude.exe 子樹下的 Playwright 瀏覽器。
+
+        取代「派 query 請 Claude 呼叫 browser_close」的舊路徑 — 舊路徑每次
+        燒一輪模型呼叫，且行政訊息會累積在長 session 的 context 裡。
+        cookies 在磁碟（user-data-dir）不受影響；MCP server 端若殘留 stale
+        handle，下次 browser_navigate 會自動重啟或報錯一次（/clear 為兜底）。
+
+        回傳殺掉的進程數；psutil 不可用或找不到 SDK 進程回 -1（呼叫端走舊路徑）。
+        """
+        if not PSUTIL_AVAILABLE:
+            return -1
+        root_pid = self._capture_sdk_subprocess_pid()
+        if root_pid is None:
+            return -1
+        try:
+            import psutil
+            root = psutil.Process(root_pid)
+            browsers = [
+                p for p in root.children(recursive=True)
+                if p.name().lower() in _BROWSER_PROC_NAMES
+            ]
+            if not browsers:
+                return 0
+            for p in browsers:
+                try:
+                    p.terminate()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            gone, alive = psutil.wait_procs(browsers, timeout=3.0)
+            for p in alive:
+                try:
+                    p.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            logger.info(f"[browser] psutil 關閉瀏覽器進程 {len(browsers)} 個（root claude.exe pid={root_pid}）")
+            return len(browsers)
+        except Exception as e:
+            logger.warning(f"[browser] psutil 關閉失敗，將 fallback 舊路徑: {e}")
+            return -1
+
     async def _cmd_browser_close(self, chat_id: int) -> str:
+        killed = self._close_browser_processes()
+        if killed >= 0:
+            self._last_browser_activity = 0.0
+            if killed > 0:
+                return (f"🛑 已直接關閉 Playwright 瀏覽器進程（{killed} 個）。"
+                        f"cookies 保留，下次需要時自動重啟。")
+            return "目前沒有偵測到 Playwright 瀏覽器進程。"
+        # psutil 路徑不可用 → 舊路徑：派 query 請 Claude 關（燒一次模型呼叫）
         if not self.sdk_client:
             return "SDK 未連線。"
         prompt = (
@@ -513,6 +639,31 @@ class ClaudeBridge:
 
     async def _cmd_keyboard(self, chat_id: int) -> str:
         return "⌨️ 鍵盤已重新顯示。"
+
+    # --- 活性心跳（v3.2.3）---
+
+    async def _heartbeat_loop(self) -> None:
+        """每 HEARTBEAT_FILE_SEC 秒 touch heartbeat.txt（TMB_Watchdog 據此判定
+        「進程在但 event loop 卡死」→ 殺掉重啟），每 HEARTBEAT_LOG_SEC 秒寫一行
+        [hb] INFO。心跳跑在主 PTB loop 上 — 主 loop 卡死＝心跳停＝watchdog 出手；
+        網路斷線但 loop 活著的情況由 error_handler 的 WARNING 負責呈現。"""
+        file_interval = CONFIG.get("HEARTBEAT_FILE_SEC", 300)
+        log_every = max(1, CONFIG.get("HEARTBEAT_LOG_SEC", 3600) // file_interval)
+        hb_file = CONFIG["LOG_DIR"] / "heartbeat.txt"
+        tick = 0
+        while True:
+            try:
+                hb_file.write_text(datetime.now().isoformat(), encoding="utf-8")
+                if tick % log_every == 0:
+                    sdk_state = "ok" if self.sdk_client else "down"
+                    logger.info(f"[hb] alive | busy={self.is_busy} queue={self._queue_waiting} sdk={sdk_state}")
+                tick += 1
+                await asyncio.sleep(file_interval)
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.warning(f"[hb] 心跳異常（續跑）: {e}")
+                await asyncio.sleep(file_interval)
 
     # --- 閒置 watchdog ---
 
@@ -532,6 +683,13 @@ class ClaudeBridge:
                 idle_for = now - self._last_browser_activity
                 if idle_for >= threshold_sec:
                     logger.info(f"[idle] Playwright 閒置 {idle_for:.0f}s ≥ {threshold_sec}s，自動關閉")
+                    # v3.1.6 P2：優先 psutil 直接關（零模型呼叫、不污染 session context）
+                    killed = self._close_browser_processes()
+                    if killed >= 0:
+                        self._last_browser_activity = 0.0
+                        logger.info(f"[idle] psutil 自動關閉完成（{killed} 個進程）")
+                        continue
+                    # psutil 不可用 → 舊路徑
                     try:
                         await self.execute_claude(
                             "Silently call mcp__playwright__browser_close. "
@@ -540,7 +698,7 @@ class ClaudeBridge:
                             photo_cb=None,
                         )
                         self._last_browser_activity = 0.0
-                        logger.info("[idle] 自動關閉 Playwright browser 完成")
+                        logger.info("[idle] 自動關閉 Playwright browser 完成（Claude 路徑）")
                     except Exception as e:
                         logger.warning(f"[idle] 自動關閉失敗: {e}")
             except asyncio.CancelledError:
@@ -570,15 +728,15 @@ class ClaudeBridge:
 
 特殊指令：
 /clear - 啟動全新 Claude session（重置所有上下文）
-/session - 顯示當前 SDK session 狀態與 ID
 /interrupt - 中斷正在跑的 Claude 任務
 /browser-close - 立即關閉 Playwright Chrome 釋放資源
 /keyboard - 重新顯示快捷鍵盤
-/history - 顯示本地參考歷史（非 Claude 上下文）
-/status - 顯示系統狀態
+/status - 顯示系統狀態（含 SDK session 完整資訊）
 /stats - 顯示使用指標
 /help - 顯示此幫助訊息
 /exec <cmd> - 直接執行 PowerShell 命令（不經 Claude；不在快捷鍵盤上避免誤觸）
+/resume [--force] <指令> - 接續桌面最近那條 Claude Code session（headless，續同一份 context/todos、落回原專案夾）。與常駐 SDK 是不同對象；會計費、不在快捷鍵盤上。桌面 session 可能還開著時會擋，加 --force 略過
+/handoff <指令> - 讀桌面最近那條 session 的尾巴做成 briefing，交給常駐 B（替身）接手。與 /resume 互補：B 記憶不完整但有串流、免 CLI 登入；只讀不寫，桌面那條還開著也能安全交棒。不在快捷鍵盤上
 
 Shortcut（直接 PowerShell）：
 /ps /cclog /tasklog /bridge /uptime
@@ -618,7 +776,8 @@ URL 處理器狀態：
         log_files = list(CONFIG["LOG_DIR"].glob("bridge.log*"))
         status = "忙碌中" if self.is_busy else "待命"
         sdk_status = "✅ 已連線" if self.sdk_client else "❌ 未連線"
-        sid = (self.current_session_id[:12] + "...") if self.current_session_id else "(尚未建立)"
+        # v3.2.2：/session 併入此處 — 顯示完整 session ID + Skills + Setting sources
+        sid = self.current_session_id or "(尚未建立，下次對話後產生)"
 
         if CONFIG.get("IMAGE_ANALYSIS_ENABLED"):
             img_status = f"✅ 啟用（最多 {CONFIG['MAX_IMAGES_PER_MESSAGE']} 張/訊息）" if GENAI_AVAILABLE else "⚠️ 啟用但 Gemini 不可用"
@@ -628,8 +787,10 @@ URL 處理器狀態：
         return f"""系統狀態 (v{VERSION})
 SDK 連線: {sdk_status}
 Session ID: {sid}
+模型: {CONFIG['SDK_MODEL']}
 Permission: {CONFIG['SDK_PERMISSION_MODE']}
-本地參考歷史: {len(self.history.messages)} 條
+Skills: {CONFIG['SDK_SKILLS']}
+Setting sources: {', '.join(CONFIG['SDK_SETTING_SOURCES'])}
 工作目錄: {CONFIG['WORKING_DIR']}
 Log 目錄: {CONFIG['LOG_DIR']}
 Log 檔案數: {len(log_files)}
@@ -657,13 +818,25 @@ URL 處理器:
         photo_cb: Optional[callable] = None,
         screenshot_collector: Optional[List[Tuple[bytes, str]]] = None,
     ) -> str:
-        if self._exec_lock.locked():
-            return "Claude 正在處理另一個任務，請稍後再試（或使用 /interrupt 中斷）..."
         if not self.sdk_client:
             return "SDK 未連線。請檢查 bridge log。"
+        # v3.1.6 P2：忙碌時排隊（FIFO ＝ asyncio.Lock waiter 順序），滿了才彈回
+        if self._exec_lock.locked() and self._queue_waiting >= CONFIG.get("QUEUE_MAX_WAITING", 2):
+            return BUSY_BOUNCE_MSG
 
-        async with self._exec_lock:
+        self._queue_waiting += 1
+        acquired = False
+        try:
+            await self._exec_lock.acquire()
+            acquired = True
+            self._queue_waiting -= 1
             return await self._execute_claude_locked(prompt, progress_cb, photo_cb, screenshot_collector)
+        finally:
+            if acquired:
+                self._exec_lock.release()
+            else:
+                # 等鎖期間被 cancel（如 bridge shutdown）— 計數要還
+                self._queue_waiting -= 1
 
     async def _execute_claude_locked(
         self,
@@ -852,6 +1025,21 @@ URL 處理器:
             logger.info(f"收到指令 (chat_id={chat_id}): {cmd}")
             return await self.special_commands[cmd](chat_id), None
 
+        # v3.1.6 P1+P2：佇列滿了在 URL 預處理「之前」就彈回（URL 不白抓、
+        # 彈回字串不落地）。佇列未滿則告知排隊後照常預處理 — 排隊的訊息
+        # 終究會執行，預處理與當前任務並行反而省等待時間。
+        if self._exec_lock.locked():
+            if self._queue_waiting >= CONFIG.get("QUEUE_MAX_WAITING", 2):
+                logger.info(f"佇列已滿彈回 (chat_id={chat_id}): {text[:60]}")
+                return BUSY_BOUNCE_MSG, None
+            position = self._queue_waiting + 1
+            logger.info(f"任務排隊 (chat_id={chat_id}, 第 {position} 位): {text[:60]}")
+            if progress_cb:
+                try:
+                    await progress_cb(f"⏳ Claude 忙碌中，已排隊（前方共 {position} 個任務）...")
+                except Exception:
+                    pass
+
         logger.info(f"收到訊息 (chat_id={chat_id}): {text[:100]}...")
         self.metrics.record_message()
 
@@ -936,6 +1124,10 @@ URL 處理器:
             enhanced_text, progress_cb=progress_cb, photo_cb=photo_cb,
             screenshot_collector=screenshot_collector,
         )
+
+        # v3.1.6 P1：TOCTOU 兜底 — 內層彈回不是分析結果，不落地、不進歷史
+        if response == BUSY_BOUNCE_MSG:
+            return response, url_status
 
         if url_summaries:
             detected = detect_urls(text)

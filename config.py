@@ -5,11 +5,11 @@ Public build: every path / secret / numeric tunable comes from environment
 variables (loaded from .env by start_bridge.bat). No hard-coded user paths.
 
 Sections:
-- CONFIG (paths, SDK, reply fetch, Telegram limits)
+- CONFIG (paths, SDK, reply fetch, queue, heartbeat, Telegram limits)
 - Auto-create runtime directories
-- _TokenRedactFilter (log redaction)
+- _TokenRedactingFormatter (log redaction; formatter-level since v3.2)
 - Structured system_prompt.append fragments
-  (Browser autoclose / Provenance / Telegram output style)
+  (Browser autoclose / Provenance / Editorial triage / Telegram output style)
 """
 
 import os
@@ -20,7 +20,7 @@ from typing import List
 
 
 # === Version ===
-VERSION = "3.1"
+VERSION = "3.3.3"
 VERSION_LABEL = f"Telegram Claude Code Bridge v{VERSION}"
 
 
@@ -122,6 +122,13 @@ CONFIG = {
     "ALLOW_DANGEROUS": _env_bool("ALLOW_DANGEROUS", False),
     "LOG_RETENTION_DAYS": _env_int("LOG_RETENTION_DAYS", 14),
     "URL_FETCH_TIMEOUT": _env_int("URL_FETCH_TIMEOUT", 15),
+    # --- langextract auto-enhance (v3.2.4) ---
+    # Whether to run an extra langextract structured-extraction pass (entity
+    # bullets) on every general-URL fetch and append it to the content given
+    # to Claude. Mostly redundant for Claude's own analysis and costs one
+    # ~2-4s Gemini call per URL, so off by default; the /extract command is
+    # unaffected and remains available on demand.
+    "LANGEXTRACT_AUTO_ENHANCE": _env_bool("LANGEXTRACT_AUTO_ENHANCE", False),
     "FETCH_OUTPUT_DIR": _env_path("FETCH_OUTPUT_DIR", BASE_DIR / "fetch_outputs"),
     "IMAGE_ANALYSIS_ENABLED": _env_bool("IMAGE_ANALYSIS_ENABLED", True),
     "MAX_IMAGES_PER_MESSAGE": _env_int("MAX_IMAGES_PER_MESSAGE", 5),
@@ -131,11 +138,52 @@ CONFIG = {
     "REPLY_KEYWORDS": _parse_keywords(),
     "REPLY_MAX_FETCH": _env_int("REPLY_MAX_FETCH", 80),
     "TWIKIT_COOKIES": _env_optional_path("TWIKIT_COOKIES"),
-    # --- SDK ---
+    # --- Task queue (v3.2) ---
+    # When busy, new messages queue up instead of bouncing (mobile usage is
+    # naturally bursty). The limit counts waiting messages (not the running
+    # one); only past the limit does the bridge bounce.
+    "QUEUE_MAX_WAITING": _env_int("QUEUE_MAX_WAITING", 2),
+    # --- Liveness heartbeat (v3.2.3) ---
+    # After httpx log-noise reduction, "healthy" means "silent" — the log can
+    # no longer distinguish healthy idle from a wedged event loop. Heartbeat:
+    # touch logs/heartbeat.txt every HEARTBEAT_FILE_SEC (a liveness signal an
+    # external watchdog can check) and write one [hb] INFO line every
+    # HEARTBEAT_LOG_SEC (24 lines/day).
+    "HEARTBEAT_FILE_SEC": _env_int("HEARTBEAT_FILE_SEC", 300),
+    "HEARTBEAT_LOG_SEC": _env_int("HEARTBEAT_LOG_SEC", 3600),
+    # --- SDK (v3.0) ---
     "SDK_PERMISSION_MODE": os.environ.get("SDK_PERMISSION_MODE", "bypassPermissions"),
     "SDK_SETTING_SOURCES": [p.strip() for p in os.environ.get("SDK_SETTING_SOURCES", "user,project,local").split(",") if p.strip()],
     "SDK_SKILLS": os.environ.get("SDK_SKILLS", "all"),
+    # --- Model pinning (v3.2.5) ---
+    # Unattended automation must pin a CONCRETE model id — never a bare alias,
+    # and never inherit the global ~/.claude/settings.json model (a global
+    # settings drift once silently switched this bridge to the most expensive
+    # model available). setting_sources includes 'user', so an explicit
+    # model= here is what keeps the bridge immune to that drift.
+    "SDK_MODEL": os.environ.get("SDK_MODEL", "claude-sonnet-5"),
     "SDK_PROGRESS_EDIT_INTERVAL": _env_float("SDK_PROGRESS_EDIT_INTERVAL", 1.5),
+    # --- /resume: continue the desktop Claude Code session headlessly (v3.2.6) ---
+    # /resume spawns a one-shot headless `claude -p --resume <sid>` that
+    # continues the most recent desktop Claude Code session (same transcript
+    # and todos, back in the original project folder). Unlike the resident
+    # SDK session it is slow (loads the whole transcript), needs CLI auth,
+    # and has no streaming — see /handoff for the lightweight alternative.
+    # RESUME_MODEL is pinned to a concrete id for the same reason as SDK_MODEL.
+    "RESUME_MODEL": os.environ.get("RESUME_MODEL", "claude-sonnet-5"),
+    "RESUME_TIMEOUT": _env_int("RESUME_TIMEOUT", 300),
+    "RESUME_LIVE_GUARD_MIN": _env_int("RESUME_LIVE_GUARD_MIN", 5),
+    # --- /handoff: brief the resident SDK session on the desktop session (v3.3.0) ---
+    # Complements /resume: instead of waking the desktop session, /handoff
+    # READS the tail of its transcript, condenses it into a briefing, and
+    # feeds that to the already-connected resident SDK session. Streaming,
+    # no CLI auth, and read-only — safe even while the desktop app is open.
+    #   HANDOFF_TAIL_RECORDS: how many meaningful records to excerpt
+    #   HANDOFF_MAX_CHARS:    cap for the assembled context block
+    #   HANDOFF_SNIPPET_CHARS: per-record truncation length
+    "HANDOFF_TAIL_RECORDS": _env_int("HANDOFF_TAIL_RECORDS", 24),
+    "HANDOFF_MAX_CHARS": _env_int("HANDOFF_MAX_CHARS", 6000),
+    "HANDOFF_SNIPPET_CHARS": _env_int("HANDOFF_SNIPPET_CHARS", 500),
     # --- Playwright idle auto-close ---
     "BROWSER_IDLE_CLOSE_MIN": _env_int("BROWSER_IDLE_CLOSE_MIN", 5),
     "BROWSER_IDLE_CHECK_SEC": _env_int("BROWSER_IDLE_CHECK_SEC", 60),
@@ -151,25 +199,30 @@ CONFIG["FETCH_OUTPUT_DIR"].mkdir(parents=True, exist_ok=True)
 CONFIG["OBSIDIAN_MOBILE_DIR"].mkdir(parents=True, exist_ok=True)
 
 
-# === Log token redaction filter ===
-# python-telegram-bot's internal httpx writes the full API URL (including the
-# bot<token>) into INFO logs. A leaked screenshot of the log would expose the
-# token, so we mask it before it hits any handler.
-class _TokenRedactFilter(logging.Filter):
+# === Log token redaction formatter ===
+# python-telegram-bot's internal httpx writes the full API URL (including
+# bot<token>) into INFO logs, so a leaked screenshot or pasted log tail
+# exposes the token.
+#
+# v3.2: moved from a logger-level Filter to a handler-level Formatter. A
+# filter attached to the root logger only sees records emitted DIRECTLY
+# through the root logger — records from child loggers (httpx, telegram.ext)
+# propagate to the root *handlers* without passing root-logger filters, so
+# the old filter never caught the main leak source. Three leak shapes are
+# covered here in one place, because Formatter.format() is the last stop
+# before the string is written out:
+#   1. propagated child-logger records
+#   2. lazy %-args containing non-str objects (httpx passes httpx.URL objects;
+#      the token only appears when the handler formats the record)
+#   3. exception tracebacks (appended by the formatter, after any filter)
+class _TokenRedactingFormatter(logging.Formatter):
     _PATTERN = re.compile(r"bot\d{5,}:[A-Za-z0-9_-]{20,}")
 
-    def filter(self, record: logging.LogRecord) -> bool:
-        try:
-            if isinstance(record.msg, str) and "bot" in record.msg:
-                record.msg = self._PATTERN.sub("bot<REDACTED>", record.msg)
-            if record.args:
-                record.args = tuple(
-                    self._PATTERN.sub("bot<REDACTED>", a) if isinstance(a, str) else a
-                    for a in record.args
-                )
-        except Exception:
-            pass
-        return True
+    def format(self, record: logging.LogRecord) -> str:
+        s = super().format(record)
+        if "bot" in s:
+            s = self._PATTERN.sub("bot<REDACTED>", s)
+        return s
 
 
 # === System prompt fragments (structured) ===
@@ -214,29 +267,59 @@ _PROVENANCE_PROTOCOL = (
 )
 
 
+# Editorial triage (v3.3.3)
+# Pain point: newer models follow instructions more LITERALLY — the Telegram
+# output style's "jump straight to the answer" plus the Provenance protocol's
+# "stay close to the fetched text" made the model treat its own spontaneous
+# editorial judgment as a violation, degrading replies into faithful
+# transcription. Fix: make the first-pass review an explicitly REQUIRED
+# output, turning the literal instruction-following into an asset.
+_EDITORIAL_TRIAGE = (
+    "## Editorial triage (URL/clipping analysis only)\n"
+    "When the user sends a URL or clipped content for analysis, OPEN your "
+    "reply with your own 2-3 sentence editorial judgment BEFORE any summary "
+    "or restatement of the fetched content. Cover, briefly:\n"
+    "- Novelty: genuinely new, or recycled/already-known?\n"
+    "- Credibility: source quality; marketing language vs verifiable claims.\n"
+    "- Relation to prior context: confirms / extends / contradicts what is "
+    "already established.\n"
+    "- Verdict: worth keeping or acting on, or safe to skip.\n"
+    "Only after this judgment give the structured summary. Restating fetched "
+    "content without a leading judgment is a protocol violation — the user "
+    "relies on you as a first-pass reviewer, not a transcriber.\n"
+    "This opening judgment is REQUIRED output, not sycophantic filler — it "
+    "does not conflict with the Telegram output style rules below."
+)
+
+
 _TELEGRAM_OUTPUT_STYLE = (
     "## Output style for Telegram replies\n"
     "Your replies are sent to a Telegram chat (4096-char per message, mobile screen). "
     "Apply these rules unless the user's request explicitly calls for verbosity "
-    "(e.g. \"detailed explanation\", \"long analysis\", \"deep dive\"):\n\n"
-    "1. **No sycophantic openings.** Skip \"Of course!\", \"Sure, I'd be happy to...\". "
-    "Jump straight to the answer.\n"
-    "2. **No closing fluff.** Skip \"Hope this helps!\", \"Let me know if you need "
-    "anything else\". End when the answer ends.\n"
+    "(e.g. \"詳細解釋\", \"long analysis\", \"deep dive\"):\n\n"
+    "1. **No sycophantic openings.** Skip \"Of course!\", \"好的！\", "
+    "\"Sure, I'd be happy to...\", \"當然可以\". Jump straight to the answer.\n"
+    "2. **No closing fluff.** Skip \"Hope this helps!\", \"希望對你有幫助\", "
+    "\"Let me know if you need anything else\". End when the answer ends.\n"
     "3. **Don't restate the user's question.** They wrote it; they know what "
-    "they asked.\n"
+    "they asked. No \"你問的是關於 X...\" or \"Regarding your question about X...\".\n"
     "4. **Tight paragraphs and bullets.** Mobile reading. Avoid long prose blocks; "
     "prefer short paragraphs (≤3 lines) and bullet lists.\n"
     "5. **Code blocks for actual code only.** Don't wrap regular sentences in "
     "triple-backticks for visual emphasis. Use inline `code` for commands/paths/"
-    "identifiers and triple-backtick blocks only for multi-line code.\n\n"
-    "These rules YIELD to the Provenance protocol above for URL analysis tasks — "
-    "the structured Claims/Sources blocks are required output, not \"closing fluff\"."
+    "identifiers and triple-backtick blocks only for multi-line code.\n"
+    "6. **Reply in the user's language.** Match the language the user writes "
+    "in unless they explicitly ask otherwise. Technical terms/identifiers may "
+    "stay in English.\n\n"
+    "These rules YIELD to the Provenance protocol and Editorial triage above for "
+    "URL analysis tasks — the leading judgment and the structured Claims/Sources "
+    "blocks are required output, not \"fluff\"."
 )
 
 
 SYSTEM_PROMPT_APPEND = "\n\n".join([
     _BROWSER_AUTOCLOSE,
     _PROVENANCE_PROTOCOL,
+    _EDITORIAL_TRIAGE,
     _TELEGRAM_OUTPUT_STYLE,
 ])
