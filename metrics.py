@@ -14,7 +14,7 @@ from threading import Lock
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_STATS_FILE = Path("stats.json")
+DEFAULT_STATS_FILE = Path(__file__).resolve().parent / "stats.json"
 
 
 class Metrics:

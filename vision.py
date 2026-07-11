@@ -23,19 +23,21 @@ except ImportError:
     _REQUESTS_AVAILABLE = False
 
 try:
-    import google.generativeai as genai
+    from google import genai as _genai
     _genai_api_key = os.getenv('GOOGLE_API_KEY')
     if _genai_api_key:
-        genai.configure(api_key=_genai_api_key)
+        _genai_client = _genai.Client(api_key=_genai_api_key)
         GENAI_AVAILABLE = True
-        logger.info("google.generativeai 可用，圖片分析功能就緒")
+        logger.info("google-genai 可用，圖片分析功能就緒")
     else:
+        _genai_client = None
         GENAI_AVAILABLE = False
-        logger.info("google.generativeai 可用但 GOOGLE_API_KEY 未設定，圖片分析功能停用")
+        logger.info("google-genai 可用但 GOOGLE_API_KEY 未設定，圖片分析功能停用")
 except ImportError:
     GENAI_AVAILABLE = False
-    genai = None
-    logger.info("google.generativeai 未安裝，圖片分析功能停用")
+    _genai = None
+    _genai_client = None
+    logger.info("google-genai 未安裝，圖片分析功能停用")
 
 # --- 預設值（可被外部 config 覆蓋）---
 
@@ -105,10 +107,8 @@ def describe_image_via_gemini(b64_data: str, mime_type: str, context: str = "",
     context: 可選的上下文提示（例如推文文字），幫助 Gemini 更好理解圖片。
     回傳圖片描述文字或 None。
     """
-    if not GENAI_AVAILABLE:
+    if not GENAI_AVAILABLE or _genai_client is None:
         return None
-
-    model = genai.GenerativeModel('gemini-2.5-flash')
 
     if context:
         prompt_text = (
@@ -124,13 +124,16 @@ def describe_image_via_gemini(b64_data: str, mime_type: str, context: str = "",
             "請使用繁體中文回答。"
         )
 
+    image_bytes = base64.b64decode(b64_data)
+    image_part = _genai.types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
+
     for attempt in range(max_retries):
         try:
-            response = model.generate_content([
-                prompt_text,
-                {"mime_type": mime_type, "data": b64_data}
-            ])
-            description = response.text.strip()
+            response = _genai_client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=[prompt_text, image_part],
+            )
+            description = (response.text or "").strip()
 
             if description:
                 logger.info(f"[image] Gemini 描述成功，{len(description)} 字元")

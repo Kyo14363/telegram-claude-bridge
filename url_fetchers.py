@@ -690,7 +690,7 @@ def save_to_obsidian(url: str, fetched_content: str, claude_response: str,
     截圖寫到 vault 的 attachments 子目錄並用 markdown image 語法嵌入筆記。
     """
     cfg = config or {}
-    obsidian_dir = Path(cfg.get("OBSIDIAN_MOBILE_DIR", Path("obsidian_clippings")))
+    obsidian_dir = Path(cfg.get("OBSIDIAN_MOBILE_DIR", Path(__file__).resolve().parent / "obsidian_clippings"))
 
     try:
         obsidian_dir.mkdir(parents=True, exist_ok=True)
@@ -805,7 +805,7 @@ def save_to_obsidian(url: str, fetched_content: str, claude_response: str,
 def save_fetch_output(url, fetched_content, claude_response, user_note="", config: dict = None):
     """Save AI-friendly markdown summary to fetch_outputs/."""
     cfg = config or {}
-    output_dir = cfg.get("FETCH_OUTPUT_DIR", Path("fetch_outputs"))
+    output_dir = cfg.get("FETCH_OUTPUT_DIR", Path(__file__).resolve().parent / "fetch_outputs")
 
     try:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -845,7 +845,7 @@ def save_fetch_output(url, fetched_content, claude_response, user_note="", confi
 # --- URL 預處理編排器 ---
 
 async def preprocess_urls(text: str, config: dict = None,
-                         metrics=None) -> Tuple[str, List[str], list]:
+                         metrics=None) -> Tuple[str, List[str]]:
     """
     偵測訊息中的 URL，自動抓取內容，回傳增強後的訊息。
 
